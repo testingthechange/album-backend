@@ -24,12 +24,54 @@ app.get('/api/health', async (req, res) => {
   }
 });
 
+// save Meta for a project
 app.post('/api/projects/:projectId/meta', async (req, res) => {
-  res.json({ ok: true, message: 'Meta save stub' });
+  const { projectId } = req.params;
+  const meta = req.body; // expected to be the full meta JSON
+
+  if (!meta || typeof meta !== 'object') {
+    return res.status(400).json({ ok: false, error: 'NO_META_PAYLOAD' });
+  }
+
+  try {
+    await pool.query(
+      `
+      INSERT INTO project_meta (project_id, meta_json)
+      VALUES ($1, $2)
+      ON CONFLICT (project_id)
+      DO UPDATE SET
+        meta_json = EXCLUDED.meta_json,
+        updated_at = now()
+      `,
+      [projectId, meta]
+    );
+
+    res.json({ ok: true, projectId });
+  } catch (err) {
+    console.error('Error saving meta', err);
+    res.status(500).json({ ok: false, error: 'META_SAVE_FAILED' });
+  }
 });
 
+// load Meta for a project
 app.get('/api/projects/:projectId/meta', async (req, res) => {
-  res.json({ ok: true, meta: null, message: 'Meta load stub' });
+  const { projectId } = req.params;
+
+  try {
+    const result = await pool.query(
+      `SELECT meta_json FROM project_meta WHERE project_id = $1`,
+      [projectId]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ ok: false, meta: null });
+    }
+
+    res.json({ ok: true, meta: result.rows[0].meta_json });
+  } catch (err) {
+    console.error('Error loading meta', err);
+    res.status(500).json({ ok: false, error: 'META_LOAD_FAILED' });
+  }
 });
 
 app.listen(port, () => {
