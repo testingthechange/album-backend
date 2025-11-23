@@ -3,26 +3,34 @@ const { S3Client, PutObjectCommand } = require("@aws-sdk/client-s3");
 
 const r2Client = new S3Client({
   region: "auto",
-  endpoint: `https://${process.env.R2_ACCOUNT_ID}.r2.cloudflarestorage.com`,
+  endpoint: process.env.R2_ENDPOINT,
   credentials: {
-    accessKeyId: process.env.R2_ACCESS_KEY_ID,
-    secretAccessKey: process.env.R2_SECRET_ACCESS_KEY,
+    accessKeyId: process.env.R2_ACCESS_KEY_ID || "",
+    secretAccessKey: process.env.R2_SECRET_ACCESS_KEY || "",
   },
 });
 
-async function saveFileToR2({ key, contentType, body }) {
-  await r2Client.send(
-    new PutObjectCommand({
-      Bucket: process.env.R2_BUCKET_NAME,
-      Key: key,
-      Body: body,
-      ContentType: contentType,
-    })
-  );
-
-  const base = (process.env.R2_PUBLIC_BASE_URL || "").replace(/\/+$/, "");
-  const url = `${base}/${key}`;
-  return url;
+if (!process.env.R2_ACCESS_KEY_ID || !process.env.R2_SECRET_ACCESS_KEY) {
+  console.error("R2 credentials are missing! Check env vars.");
 }
 
-module.exports = { saveFileToR2 };
+const bucket = process.env.R2_BUCKET || "album-storage";
+
+async function uploadSongToR2({ projectId, songId, fileBuffer, contentType }) {
+  const key = `projects/${projectId}/songs/${songId}.mp3`;
+
+  const command = new PutObjectCommand({
+    Bucket: bucket,
+    Key: key,
+    Body: fileBuffer,
+    ContentType: contentType || "audio/mpeg",
+  });
+
+  await r2Client.send(command);
+
+  // public-ish URL (we can refine later)
+  const url = `${process.env.R2_ENDPOINT}/${bucket}/${key}`;
+  return { key, url };
+}
+
+module.exports = { uploadSongToR2 };
