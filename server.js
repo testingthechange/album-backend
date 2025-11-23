@@ -1,12 +1,15 @@
-console.log('server.js is running...');
-
-const express = require('express');
-const cors = require('cors');
-const { Pool } = require('pg');
+// server.js
+const express = require("express");
+const cors = require("cors");
+const { Pool } = require("pg");
+const multer = require("multer");
+const upload = multer({ storage: multer.memoryStorage() });
+const { saveFileToR2 } = require("./storage");
 
 const app = express();
 const port = process.env.PORT || 3000;
 
+// Postgres pool; Render will use DATABASE_URL
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
 });
@@ -14,9 +17,10 @@ const pool = new Pool({
 app.use(cors());
 app.use(express.json());
 
-app.get('/api/health', async (req, res) => {
+// health check
+app.get("/api/health", async (req, res) => {
   try {
-    await pool.query('SELECT 1');
+    await pool.query("SELECT 1");
     res.json({ ok: true });
   } catch (err) {
     console.error(err);
@@ -24,13 +28,15 @@ app.get('/api/health', async (req, res) => {
   }
 });
 
+// ---------- META ENDPOINTS ----------
+
 // save Meta for a project
-app.post('/api/projects/:projectId/meta', async (req, res) => {
+app.post("/api/projects/:projectId/meta", async (req, res) => {
   const { projectId } = req.params;
   const meta = req.body; // expected to be the full meta JSON
 
-  if (!meta || typeof meta !== 'object') {
-    return res.status(400).json({ ok: false, error: 'NO_META_PAYLOAD' });
+  if (!meta || typeof meta !== "object") {
+    return res.status(400).json({ ok: false, error: "NO_META_PAYLOAD" });
   }
 
   try {
@@ -48,13 +54,13 @@ app.post('/api/projects/:projectId/meta', async (req, res) => {
 
     res.json({ ok: true, projectId });
   } catch (err) {
-    console.error('Error saving meta', err);
-    res.status(500).json({ ok: false, error: 'META_SAVE_FAILED' });
+    console.error("Error saving meta", err);
+    res.status(500).json({ ok: false, error: "META_SAVE_FAILED" });
   }
 });
 
 // load Meta for a project
-app.get('/api/projects/:projectId/meta', async (req, res) => {
+app.get("/api/projects/:projectId/meta", async (req, res) => {
   const { projectId } = req.params;
 
   try {
@@ -69,10 +75,41 @@ app.get('/api/projects/:projectId/meta', async (req, res) => {
 
     res.json({ ok: true, meta: result.rows[0].meta_json });
   } catch (err) {
-    console.error('Error loading meta', err);
-    res.status(500).json({ ok: false, error: 'META_LOAD_FAILED' });
+    console.error("Error loading meta", err);
+    res.status(500).json({ ok: false, error: "META_LOAD_FAILED" });
   }
 });
+
+// ---------- MP3 UPLOAD → R2 ----------
+
+app.post(
+  "/api/projects/:projectId/songs/:songId/upload",
+  upload.single("file"),
+  async (req, res) => {
+    const { projectId, songId } = req.params;
+
+    if (!req.file) {
+      return res.status(400).json({ ok: false, error: "NO_FILE" });
+    }
+
+    const key = `projects/${projectId}/songs/${songId}/${req.file.originalname}`;
+
+    try {
+      const url = await saveFileToR2({
+        key,
+        contentType: req.file.mimetype,
+        body: req.file.buffer,
+      });
+
+      res.json({ ok: true, url });
+    } catch (err) {
+      console.error("R2 upload failed", err);
+      res.status(500).json({ ok: false, error: "UPLOAD_FAILED" });
+    }
+  }
+);
+
+// ---------- SERVER START ----------
 
 app.listen(port, () => {
   console.log(`Backend listening on port ${port}`);
