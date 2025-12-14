@@ -4,7 +4,8 @@ const cors = require("cors");
 const { Pool } = require("pg");
 const multer = require("multer");
 const upload = multer({ storage: multer.memoryStorage() });
-const { saveFileToR2 } = require("./storage");
+const { saveFileToR2, putJson } = require("./storage");
+
 
 const app = express();
 const port = process.env.PORT || 3000;
@@ -110,6 +111,42 @@ app.post(
 );
 
 // ---------- SERVER START ----------
+app.post("/api/master-save", async (req, res) => {
+  try {
+    const { projectId, project } = req.body || {};
+    if (!projectId || !project) {
+      return res.status(400).json({ ok: false, error: "Missing projectId or project" });
+    }
+
+    const now = new Date().toISOString();
+    const ts = now.replace(/[:.]/g, "-");
+
+    const snapshotKey = `storage/projects/${projectId}/producer_returns/snapshots/${ts}.json`;
+    const latestKey = `storage/projects/${projectId}/producer_returns/latest.json`;
+
+    // use your existing storage helper:
+    // - if storage.js exports putJson, use putJson(...)
+    // - otherwise replace putJson with whatever your JSON upload function is
+    await putJson(snapshotKey, {
+      projectId,
+      createdAt: now,
+      source: "minisite-master-save",
+      data: project,
+    });
+
+    await putJson(latestKey, {
+      projectId,
+      latestSnapshotKey: snapshotKey,
+      lastMasterSaveAt: now,
+    });
+
+    return res.json({ ok: true, snapshotKey, latestKey });
+  } catch (err) {
+    console.error("master-save error:", err);
+    return res.status(500).json({ ok: false, error: err?.message || String(err) });
+  }
+});
+Add master-save endpoint
 
 app.listen(port, () => {
   console.log(`Backend listening on port ${port}`);
