@@ -1,4 +1,25 @@
 // server.js
+import cors from "cors";
+
+const ALLOWED_ORIGINS = [
+  "https://blackout-web.onrender.com",
+  "http://localhost:5173",
+  "http://localhost:4173",
+];
+
+app.use(
+  cors({
+    origin: (origin, cb) => {
+      if (!origin) return cb(null, true);
+      if (ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
+      return cb(new Error(`CORS blocked origin: ${origin}`), false);
+    },
+    methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+  })
+);
+
+app.options("*", cors());
+
 const express = require("express");
 const cors = require("cors");
 const { Pool } = require("pg");
