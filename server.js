@@ -1,6 +1,15 @@
 // server.js
-import cors from "cors";
+const express = require("express");
+const cors = require("cors");
+const { Pool } = require("pg");
+const multer = require("multer");
+const upload = multer({ storage: multer.memoryStorage() });
+const { saveFileToR2, putJson } = require("./storage");
 
+const app = express();
+const port = process.env.PORT || 3000;
+
+// ---------- CORS (REQUIRED FOR FRONTEND) ----------
 const ALLOWED_ORIGINS = [
   "https://blackout-web.onrender.com",
   "http://localhost:5173",
@@ -10,6 +19,7 @@ const ALLOWED_ORIGINS = [
 app.use(
   cors({
     origin: (origin, cb) => {
+      // allow server-to-server + health checks
       if (!origin) return cb(null, true);
       if (ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
       return cb(new Error(`CORS blocked origin: ${origin}`), false);
@@ -19,27 +29,19 @@ app.use(
 );
 
 app.options("*", cors());
+app.use(express.json());
 
-const express = require("express");
-const cors = require("cors");
-const { Pool } = require("pg");
-const multer = require("multer");
-const upload = multer({ storage: multer.memoryStorage() });
-const { saveFileToR2, putJson } = require("./storage");
-
-
-const app = express();
-const port = process.env.PORT || 3000;
-
-// Postgres pool; Render will use DATABASE_URL
+// ---------- DATABASE ----------
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
 });
 
-app.use(cors());
-app.use(express.json());
+// ---------- ROOT (frontend ping hits this) ----------
+app.get("/", (req, res) => {
+  res.status(200).send("album-backend OK");
+});
 
-// health check
+// ---------- HEALTH ----------
 app.get("/api/health", async (req, res) => {
   try {
     await pool.query("SELECT 1");
@@ -50,12 +52,10 @@ app.get("/api/health", async (req, res) => {
   }
 });
 
-// ---------- META ENDPOINTS ----------
-
-// save Meta for a project
+// ---------- META ----------
 app.post("/api/projects/:projectId/meta", async (req, res) => {
   const { projectId } = req.params;
-  const meta = req.body; // expected to be the full meta JSON
+  const meta = req.body;
 
   if (!meta || typeof meta !== "object") {
     return res.status(400).json({ ok: false, error: "NO_META_PAYLOAD" });
@@ -81,7 +81,6 @@ app.post("/api/projects/:projectId/meta", async (req, res) => {
   }
 });
 
-// load Meta for a project
 app.get("/api/projects/:projectId/meta", async (req, res) => {
   const { projectId } = req.params;
 
@@ -103,7 +102,6 @@ app.get("/api/projects/:projectId/meta", async (req, res) => {
 });
 
 // ---------- MP3 UPLOAD → R2 ----------
-
 app.post(
   "/api/projects/:projectId/songs/:songId/upload",
   upload.single("file"),
@@ -131,7 +129,7 @@ app.post(
   }
 );
 
-// ---------- SERVER START ----------
+// ---------- MASTER SAVE ----------
 app.post("/api/master-save", async (req, res) => {
   try {
     const { projectId, project } = req.body || {};
@@ -145,9 +143,6 @@ app.post("/api/master-save", async (req, res) => {
     const snapshotKey = `storage/projects/${projectId}/producer_returns/snapshots/${ts}.json`;
     const latestKey = `storage/projects/${projectId}/producer_returns/latest.json`;
 
-    // use your existing storage helper:
-    // - if storage.js exports putJson, use putJson(...)
-    // - otherwise replace putJson with whatever your JSON upload function is
     await putJson(snapshotKey, {
       projectId,
       createdAt: now,
@@ -161,14 +156,14 @@ app.post("/api/master-save", async (req, res) => {
       lastMasterSaveAt: now,
     });
 
-    return res.json({ ok: true, snapshotKey, latestKey });
+    res.json({ ok: true, snapshotKey, latestKey });
   } catch (err) {
     console.error("master-save error:", err);
-    return res.status(500).json({ ok: false, error: err?.message || String(err) });
+    res.status(500).json({ ok: false, error: err?.message || String(err) });
   }
 });
-Add master-save endpoint
 
+// ---------- START ----------
 app.listen(port, () => {
-  console.log(`Backend listening on port ${port}`);
+  console.log(`album-backend listening on port ${port}`);
 });
