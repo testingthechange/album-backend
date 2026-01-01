@@ -19,7 +19,7 @@ const ALLOWED_ORIGINS = [
 app.use(
   cors({
     origin: (origin, cb) => {
-      // allow server-to-server + health checks
+      // allow server-to-server + health checks (no Origin header)
       if (!origin) return cb(null, true);
       if (ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
       return cb(new Error(`CORS blocked origin: ${origin}`), false);
@@ -28,7 +28,10 @@ app.use(
   })
 );
 
-app.options("*", cors());
+// IMPORTANT: do NOT use app.options("*", ...) here — it can crash with path-to-regexp/router.
+// If you later need explicit preflight handling, use a safe regex form like:
+// app.options(/.*/, cors());
+
 app.use(express.json());
 
 // ---------- DATABASE ----------
