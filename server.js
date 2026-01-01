@@ -25,6 +25,7 @@ app.use(
       return cb(new Error(`CORS blocked origin: ${origin}`), false);
     },
     methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization"],
   })
 );
 
@@ -32,7 +33,7 @@ app.use(
 // If you later need explicit preflight handling, use a safe regex form like:
 // app.options(/.*/, cors());
 
-app.use(express.json());
+app.use(express.json({ limit: "10mb" }));
 
 // ---------- DATABASE ----------
 const pool = new Pool({
@@ -163,6 +164,39 @@ app.post("/api/master-save", async (req, res) => {
   } catch (err) {
     console.error("master-save error:", err);
     res.status(500).json({ ok: false, error: err?.message || String(err) });
+  }
+});
+
+// ---------- PUBLISH MANIFEST (READ) ----------
+// Phase 0/1: shareId-based manifest fetch for Shop/Product.
+// For now this returns a stable demo manifest.
+// Later: map shareId -> manifestKey, then read JSON from R2/S3 and return it.
+app.get("/api/publish/:shareId/manifest", async (req, res) => {
+  try {
+    const shareId = String(req.params.shareId || "").trim();
+    if (!shareId) return res.status(400).json({ ok: false, error: "MISSING_SHARE_ID" });
+
+    const manifest = {
+      shareId,
+      album: {
+        id: "album-001",
+        albumName: "Block Radius (Published)",
+        artist: "Block Radius",
+        releaseDate: "2025-12-31",
+        coverUrl: "https://placehold.co/800x800/png?text=Published+Cover",
+        tracks: [
+          { id: "t1", title: "Track 1", previewUrl: "" },
+          { id: "t2", title: "Track 2", previewUrl: "" },
+        ],
+        modes: { album: true, smartBridge: true },
+        perks: { freeNftMp3Mix: true },
+      },
+    };
+
+    return res.json({ ok: true, manifest });
+  } catch (err) {
+    console.error("manifest read error:", err);
+    return res.status(500).json({ ok: false, error: "MANIFEST_READ_FAILED" });
   }
 });
 
