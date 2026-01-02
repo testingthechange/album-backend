@@ -3,9 +3,11 @@ const express = require("express");
 const cors = require("cors");
 const { Pool } = require("pg");
 const multer = require("multer");
+const crypto = require("crypto");
+
 const upload = multer({ storage: multer.memoryStorage() });
 
-// ✅ UPDATED: include getJson
+// ✅ IMPORTANT: storage must export getJson + putJson (and saveFileToR2 if used)
 const { saveFileToR2, putJson, getJson } = require("./storage");
 
 const app = express();
@@ -21,7 +23,6 @@ const ALLOWED_ORIGINS = [
 app.use(
   cors({
     origin: (origin, cb) => {
-      // allow server-to-server + health checks (no Origin header)
       if (!origin) return cb(null, true);
       if (ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
       return cb(new Error(`CORS blocked origin: ${origin}`), false);
@@ -30,18 +31,14 @@ app.use(
   })
 );
 
-// IMPORTANT: do NOT use app.options("*", ...) here — it can crash with path-to-regexp/router.
-// If you later need explicit preflight handling, use a safe regex form like:
-// app.options(/.*/, cors());
-
-app.use(express.json());
+app.use(express.json({ limit: process.env.JSON_LIMIT || "60mb" }));
 
 // ---------- DATABASE ----------
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
 });
 
-// ---------- ROOT (frontend ping hits this) ----------
+// ---------- ROOT ----------
 app.get("/", (req, res) => {
   res.status(200).send("album-backend OK");
 });
@@ -55,6 +52,26 @@ app.get("/api/health", async (req, res) => {
     console.error(err);
     res.status(500).json({ ok: false });
   }
+});
+
+// ✅ publish-proof (used to verify the deployed file/version)
+app.get("/api/publish-proof", (req, res) => {
+  res.json({
+    ok: true,
+    proof: "publish-proof-v1-album-backend",
+    commit: process.env.RENDER_GIT_COMMIT || "unknown",
+    deployedAt: process.env.RENDER_DEPLOYED_AT || "unknown",
+  });
+});
+
+// ✅ version
+app.get("/api/version", (req, res) => {
+  res.json({
+    ok: true,
+    service: "album-backend",
+    commit: process.env.RENDER_GIT_COMMIT || "unknown",
+    deployedAt: process.env.RENDER_DEPLOYED_AT || "unknown",
+  });
 });
 
 // ---------- META ----------
@@ -134,7 +151,7 @@ app.post(
   }
 );
 
-// ---------- MASTER SAVE ----------
+// ---------- MASTER SAVE (WRITE) ----------
 app.post("/api/master-save", async (req, res) => {
   try {
     const { projectId, project } = req.body || {};
@@ -168,28 +185,124 @@ app.post("/api/master-save", async (req, res) => {
   }
 });
 
-// ✅ ADDITION: MASTER SAVE LATEST (READ)
-// This is what your frontend/local curl is calling: /api/master-save/latest/:projectId
-// It requires getJson() from storage.js
+// ---------- MASTER SAVE (READ LATEST) ----------
 app.get("/api/master-save/latest/:projectId", async (req, res) => {
   try {
     const { projectId } = req.params;
     const latestKey = `storage/projects/${projectId}/producer_returns/latest.json`;
 
     const latest = await getJson(latestKey);
-    const snapKey =
-      String(latest?.latestSnapshotKey || "").trim() ||
-      String(latest?.snapshotKey || "").trim();
-
-    if (!snapKey) {
-      return res.status(404).json({ ok: false, error: "NO_LATEST_SNAPSHOT_KEY", latestKey });
+    if (!latest?.latestSnapshotKey) {
+      return res.status(404).json({
+        ok: false,
+        error: "NO_LATEST_FOUND",
+        hint: "POST /api/master-save first to create latest.json",
+        latestKey,
+      });
     }
 
-    const snapshot = await getJson(snapKey);
+    const snapshot = await getJson(latest.latestSnapshotKey);
 
     res.json({ ok: true, latestKey, latest, snapshot });
   } catch (err) {
     console.error("master-save latest error:", err);
+    res.status(500).json({ ok: false, error: err?.message || String(err) });
+  }
+});
+
+// =======================================================
+// PUBLISH MINI SITE (Option 1: shareId-based manifest)
+// POST /api/publish-minisite
+// body: { projectId, snapshotKey }
+// - reads snapshot JSON from R2/S3 (getJson)
+// - extracts tracks from snapshot (basic)
+// - stores manifest at: public/players/<shareId>/manifest.json
+// - returns shareId + publicUrl-ish pointer + manifestKey
+// =======================================================
+function extractTracksFromProject(project) {
+  const songs = Array.isArray(project?.catalog?.songs) ? project.catalog.songs : [];
+  return songs
+    .map((s, idx) => {
+      const slot = Number(s?.slot || idx + 1);
+      const title = String(s?.title || `Track ${slot}`).trim();
+      const s3Key =
+        String(s?.files?.album?.s3Key || "").trim() ||
+        String(s?.files?.a?.s3Key || "").trim() ||
+        String(s?.files?.b?.s3Key || "").trim();
+      return s3Key ? { slot, title, s3Key } : null;
+    })
+    .filter(Boolean);
+}
+
+app.post("/api/publish-minisite", async (req, res) => {
+  try {
+    const { projectId, snapshotKey } = req.body || {};
+    if (!projectId || !snapshotKey) {
+      return res.status(400).json({ ok: false, error: "Missing projectId or snapshotKey" });
+    }
+
+    const snapWrap = await getJson(snapshotKey);
+
+    // Your master-save wrapper shape is { projectId, createdAt, source, data: project }
+    const project = snapWrap?.data || snapWrap?.project || snapWrap?.snapshot || null;
+    if (!project || typeof project !== "object") {
+      return res.status(400).json({ ok: false, error: "Snapshot invalid or missing project data" });
+    }
+
+    const tracks = extractTracksFromProject(project);
+    if (!tracks.length) {
+      return res.status(400).json({
+        ok: false,
+        error: "No playable tracks found in snapshot (expected catalog.songs[*].files.album/a/b.s3Key)",
+      });
+    }
+
+    const shareId = crypto.randomBytes(8).toString("hex");
+    const manifestKey = `public/players/${shareId}/manifest.json`;
+
+    const manifest = {
+      ok: true,
+      version: 1,
+      shareId,
+      projectId: String(projectId),
+      snapshotKey: String(snapshotKey),
+      publishedAt: new Date().toISOString(),
+      trackCount: tracks.length,
+      tracks,
+    };
+
+    // store manifest JSON in R2/S3
+    await putJson(manifestKey, manifest);
+
+    // publicUrl depends on how you serve public/players — for now, return the API manifest endpoint
+    res.json({
+      ok: true,
+      shareId,
+      manifestKey,
+      manifestUrl: `/api/publish/${shareId}/manifest`,
+    });
+  } catch (err) {
+    console.error("publish-minisite error:", err);
+    res.status(500).json({ ok: false, error: err?.message || String(err) });
+  }
+});
+
+// ✅ Option 1 endpoint (read-only): GET /api/publish/:shareId/manifest
+app.get("/api/publish/:shareId/manifest", async (req, res) => {
+  try {
+    const shareId = String(req.params.shareId || "").trim();
+    if (!shareId) return res.status(400).json({ ok: false, error: "MISSING_SHARE_ID" });
+
+    const manifestKey = `public/players/${shareId}/manifest.json`;
+    const manifest = await getJson(manifestKey);
+
+    if (!manifest) {
+      return res.status(404).json({ ok: false, error: "MANIFEST_NOT_FOUND", shareId });
+    }
+
+    res.json({ ok: true, manifest });
+  } catch (err) {
+    console.error("publish manifest error:", err);
     res.status(500).json({ ok: false, error: err?.message || String(err) });
   }
 });
