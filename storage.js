@@ -1,9 +1,6 @@
 // storage.js
-const {
-  S3Client,
-  PutObjectCommand,
-  GetObjectCommand,
-} = require("@aws-sdk/client-s3");
+const { S3Client, PutObjectCommand, GetObjectCommand } = require("@aws-sdk/client-s3");
+const { getSignedUrl } = require("@aws-sdk/s3-request-presigner");
 
 // ---------- ENV ----------
 const BUCKET =
@@ -22,6 +19,10 @@ const ENDPOINT = process.env.AWS_ENDPOINT || process.env.R2_ENDPOINT;
 if (!BUCKET) {
   console.warn("⚠️ storage.js: BUCKET env var missing");
 }
+if (!ENDPOINT && REGION === "auto") {
+  // not fatal, but usually R2 requires endpoint
+  console.warn("⚠️ storage.js: R2 endpoint missing (R2_ENDPOINT / AWS_ENDPOINT). If using AWS S3, this may be fine.");
+}
 
 const s3 = new S3Client({
   region: REGION,
@@ -31,8 +32,18 @@ const s3 = new S3Client({
         accessKeyId: process.env.AWS_ACCESS_KEY_ID,
         secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
       }
-    : undefined, // Render IAM / R2 bindings
+    : undefined, // If you’re using IAM role or platform-provided creds
 });
+
+// ---------- STREAM UTILS ----------
+function streamToString(stream) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    stream.on("data", (chunk) => chunks.push(chunk));
+    stream.on("error", reject);
+    stream.on("end", () => resolve(Buffer.concat(chunks).toString("utf-8")));
+  });
+}
 
 // ---------- HELPERS ----------
 async function putJson(key, data) {
@@ -67,7 +78,15 @@ async function getJson(key) {
     const text = await streamToString(out.Body);
     return JSON.parse(text);
   } catch (err) {
-    if (err?.$metadata?.httpStatusCode === 404) {
+    // R2 + AWS SDK sometimes does not give httpStatusCode on NoSuchKey
+    const msg = String(err?.name || err?.Code || err?.message || "");
+    const isNotFound =
+      err?.$metadata?.httpStatusCode === 404 ||
+      msg.includes("NoSuchKey") ||
+      msg.includes("NotFound") ||
+      msg.includes("404");
+
+    if (isNotFound) {
       throw new Error("JSON_NOT_FOUND");
     }
     throw err;
@@ -88,19 +107,26 @@ async function saveFileToR2({ key, body, contentType }) {
     })
   );
 
+  // Keep behavior consistent with your existing backend
   return key;
 }
 
-// ---------- STREAM UTILS ----------
-function streamToString(stream) {
-  return new Promise((resolve, reject) => {
-    const chunks = [];
-    stream.on("data", (chunk) => chunks.push(chunk));
-    stream.on("error", reject);
-    stream.on("end", () =>
-      resolve(Buffer.concat(chunks).toString("utf-8"))
-    );
-  });
+// ✅ NEW: presign a GET url for playback
+async function presignGet(key, expiresInSec = 1200) {
+  if (!key) throw new Error("presignGet: missing key");
+
+  const url = await getSignedUrl(
+    s3,
+    new GetObjectCommand({
+      Bucket: BUCKET,
+      Key: key,
+      ResponseCacheControl: "no-store, max-age=0",
+      ResponseExpires: new Date(0).toUTCString(),
+    }),
+    { expiresIn: Number(expiresInSec) || 1200 }
+  );
+
+  return url;
 }
 
 // ---------- EXPORTS ----------
@@ -108,4 +134,5 @@ module.exports = {
   putJson,
   getJson,
   saveFileToR2,
+  presignGet,
 };
