@@ -1,11 +1,14 @@
 // storage.js
-const {
-  S3Client,
-  PutObjectCommand,
-  GetObjectCommand,
-} = require("@aws-sdk/client-s3");
+const { S3Client, PutObjectCommand, GetObjectCommand } = require("@aws-sdk/client-s3");
 
-const { getSignedUrl } = require("@aws-sdk/s3-request-presigner");
+// OPTIONAL dependency (prevents deploy crash if not installed)
+let getSignedUrl = null;
+try {
+  ({ getSignedUrl } = require("@aws-sdk/s3-request-presigner"));
+} catch (e) {
+  // Do not crash the server if the package isn't installed yet
+  console.warn("⚠️ @aws-sdk/s3-request-presigner not installed. Presigned URLs disabled.");
+}
 
 // ---------- ENV ----------
 const BUCKET =
@@ -16,16 +19,16 @@ const BUCKET =
 const REGION =
   process.env.AWS_REGION ||
   process.env.AWS_DEFAULT_REGION ||
-  "auto"; // R2 uses "auto"
+  "auto";
 
 const ENDPOINT =
   process.env.AWS_ENDPOINT ||
   process.env.R2_ENDPOINT ||
   undefined;
 
-// If you're using Cloudflare R2, ENDPOINT is required and usually looks like:
-// https://<accountid>.r2.cloudflarestorage.com
-// (or a custom domain if you set one)
+// Optional: if your bucket is public via a domain, set this and we can return playable URLs without presigning
+// Example: https://pub-xxxxx.r2.dev  OR https://files.yourdomain.com
+const PUBLIC_FILES_BASE_URL = String(process.env.PUBLIC_FILES_BASE_URL || "").replace(/\/+$/, "");
 
 if (!BUCKET) console.warn("⚠️ storage.js: BUCKET env var missing");
 
@@ -33,7 +36,6 @@ if (!BUCKET) console.warn("⚠️ storage.js: BUCKET env var missing");
 const s3 = new S3Client({
   region: REGION,
   endpoint: ENDPOINT,
-  // R2 often needs path-style addressing; S3 generally doesn't mind.
   forcePathStyle: Boolean(ENDPOINT),
   credentials: process.env.AWS_ACCESS_KEY_ID
     ? {
@@ -76,20 +78,12 @@ async function getJson(key) {
   if (!key) throw new Error("getJson: missing key");
 
   try {
-    const out = await s3.send(
-      new GetObjectCommand({
-        Bucket: BUCKET,
-        Key: key,
-      })
-    );
-
+    const out = await s3.send(new GetObjectCommand({ Bucket: BUCKET, Key: key }));
     const text = await streamToString(out.Body);
     return JSON.parse(text);
   } catch (err) {
-    // normalize not-found into a consistent error string
     const code = err?.name || err?.Code || "";
     const http = err?.$metadata?.httpStatusCode;
-
     if (http === 404 || code === "NoSuchKey" || code === "NotFound") {
       throw new Error("JSON_NOT_FOUND");
     }
@@ -97,7 +91,7 @@ async function getJson(key) {
   }
 }
 
-// ---------- FILE UPLOAD (optional; keeps your existing behavior) ----------
+// ---------- FILE UPLOAD ----------
 async function saveFileToR2({ key, body, contentType }) {
   if (!key) throw new Error("saveFileToR2: missing key");
   if (!body) throw new Error("saveFileToR2: missing body");
@@ -115,9 +109,21 @@ async function saveFileToR2({ key, body, contentType }) {
   return key;
 }
 
-// ---------- PRESIGNED GET URL (THIS IS THE MISSING PIECE FOR PLAYBACK) ----------
+// ---------- PLAYBACK URL HELPERS ----------
+function buildPublicUrl(key) {
+  if (!PUBLIC_FILES_BASE_URL) return "";
+  return `${PUBLIC_FILES_BASE_URL}/${String(key).replace(/^\/+/, "")}`;
+}
+
 async function presignGetUrl(key, expiresInSeconds = 60 * 20) {
   if (!key) throw new Error("presignGetUrl: missing key");
+
+  // If you set PUBLIC_FILES_BASE_URL, we can return playable URLs without presigner.
+  const publicUrl = buildPublicUrl(key);
+  if (publicUrl) return publicUrl;
+
+  // If presigner isn't installed, don't crash; return empty string (server can still publish manifests).
+  if (!getSignedUrl) return "";
 
   return await getSignedUrl(
     s3,
@@ -125,13 +131,11 @@ async function presignGetUrl(key, expiresInSeconds = 60 * 20) {
       Bucket: BUCKET,
       Key: key,
       ResponseCacheControl: "no-store, max-age=0",
-      ResponseExpires: new Date(0).toUTCString(),
     }),
     { expiresIn: expiresInSeconds }
   );
 }
 
-// ---------- EXPORTS ----------
 module.exports = {
   putJson,
   getJson,
