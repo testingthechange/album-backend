@@ -3,8 +3,12 @@ const express = require("express");
 const cors = require("cors");
 const { Pool } = require("pg");
 const multer = require("multer");
+const crypto = require("crypto");
+
 const upload = multer({ storage: multer.memoryStorage() });
-const { saveFileToR2, putJson } = require("./storage");
+
+// storage layer (R2)
+const { saveFileToR2, putJson, getJson } = require("./storage");
 
 const app = express();
 const port = process.env.PORT || 3000;
@@ -25,15 +29,10 @@ app.use(
       return cb(new Error(`CORS blocked origin: ${origin}`), false);
     },
     methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Authorization"],
   })
 );
 
-// IMPORTANT: do NOT use app.options("*", ...) here — it can crash with path-to-regexp/router.
-// If you later need explicit preflight handling, use a safe regex form like:
-// app.options(/.*/, cors());
-
-app.use(express.json({ limit: "10mb" }));
+app.use(express.json());
 
 // ---------- DATABASE ----------
 const pool = new Pool({
@@ -43,6 +42,25 @@ const pool = new Pool({
 // ---------- ROOT (frontend ping hits this) ----------
 app.get("/", (req, res) => {
   res.status(200).send("album-backend OK");
+});
+
+// ---------- VERSION / PROOF (debug routes) ----------
+app.get("/api/version", (req, res) => {
+  res.json({
+    ok: true,
+    service: "album-backend",
+    commit: process.env.RENDER_GIT_COMMIT || "unknown",
+    deployedAt: process.env.RENDER_DEPLOYED_AT || "unknown",
+  });
+});
+
+app.get("/api/publish-proof", (req, res) => {
+  res.json({
+    ok: true,
+    proof: "publish-proof-v1-album-backend",
+    commit: process.env.RENDER_GIT_COMMIT || "unknown",
+    deployedAt: process.env.RENDER_DEPLOYED_AT || "unknown",
+  });
 });
 
 // ---------- HEALTH ----------
@@ -133,7 +151,13 @@ app.post(
   }
 );
 
-// ---------- MASTER SAVE ----------
+// =======================================================
+// MASTER SAVE (WRITE)
+// expects { projectId, project }
+// writes:
+//   storage/projects/{projectId}/producer_returns/snapshots/{ts}.json
+//   storage/projects/{projectId}/producer_returns/latest.json
+// =======================================================
 app.post("/api/master-save", async (req, res) => {
   try {
     const { projectId, project } = req.body || {};
@@ -148,16 +172,15 @@ app.post("/api/master-save", async (req, res) => {
     const latestKey = `storage/projects/${projectId}/producer_returns/latest.json`;
 
     await putJson(snapshotKey, {
-      projectId,
-      createdAt: now,
-      source: "minisite-master-save",
-      data: project,
+      projectId: String(projectId),
+      savedAt: now,
+      project,
     });
 
     await putJson(latestKey, {
-      projectId,
+      projectId: String(projectId),
       latestSnapshotKey: snapshotKey,
-      lastMasterSaveAt: now,
+      savedAt: now,
     });
 
     res.json({ ok: true, snapshotKey, latestKey });
@@ -167,36 +190,129 @@ app.post("/api/master-save", async (req, res) => {
   }
 });
 
-// ---------- PUBLISH MANIFEST (READ) ----------
-// Phase 0/1: shareId-based manifest fetch for Shop/Product.
-// For now this returns a stable demo manifest.
-// Later: map shareId -> manifestKey, then read JSON from R2/S3 and return it.
-app.get("/api/publish/:shareId/manifest", async (req, res) => {
+// =======================================================
+// MASTER SAVE (READ BACK)
+// GET /api/master-save/latest/:projectId
+// =======================================================
+app.get("/api/master-save/latest/:projectId", async (req, res) => {
   try {
-    const shareId = String(req.params.shareId || "").trim();
-    if (!shareId) return res.status(400).json({ ok: false, error: "MISSING_SHARE_ID" });
+    const { projectId } = req.params;
+    const latestKey = `storage/projects/${projectId}/producer_returns/latest.json`;
+
+    const latest = await getJson(latestKey);
+    if (!latest || !latest.latestSnapshotKey) {
+      return res.status(404).json({
+        ok: false,
+        error: "NO_LATEST_FOUND",
+        latestKey,
+      });
+    }
+
+    const snapshot = await getJson(latest.latestSnapshotKey);
+    return res.json({ ok: true, latestKey, latest, snapshot });
+  } catch (err) {
+    console.error("master-save latest error:", err);
+    res.status(500).json({ ok: false, error: err?.message || String(err) });
+  }
+});
+
+// =======================================================
+// PUBLISH (Option 1 shareId-based)
+// POST /api/publish-minisite
+// body: { projectId, snapshotKey }
+// writes manifest to:
+//   storage/public/publish/{shareId}/manifest.json
+// =======================================================
+function safeString(v) {
+  return String(v ?? "").trim();
+}
+
+function extractTracksFromSnapshot(snap) {
+  const inner = snap?.project || snap?.snapshot || snap || null;
+  const songs = Array.isArray(inner?.catalog?.songs) ? inner.catalog.songs : [];
+
+  return songs
+    .map((s, idx) => {
+      const slot = Number(s?.slot || idx + 1);
+      const title = safeString(s?.title) || `Track ${slot}`;
+
+      // use album s3Key if present
+      const s3Key = safeString(s?.files?.album?.s3Key) || safeString(s?.files?.a?.s3Key) || safeString(s?.files?.b?.s3Key);
+      if (!s3Key) return null;
+
+      return { slot, title, s3Key };
+    })
+    .filter(Boolean);
+}
+
+app.post("/api/publish-minisite", async (req, res) => {
+  try {
+    const { projectId, snapshotKey } = req.body || {};
+    if (!projectId || !snapshotKey) {
+      return res.status(400).json({ ok: false, error: "Missing projectId or snapshotKey" });
+    }
+
+    // read snapshot json
+    const snapWrap = await getJson(snapshotKey);
+    if (!snapWrap || typeof snapWrap !== "object") {
+      return res.status(400).json({ ok: false, error: "Snapshot not found or invalid JSON at snapshotKey" });
+    }
+
+    const tracks = extractTracksFromSnapshot(snapWrap);
+    if (!tracks.length) {
+      return res.status(400).json({
+        ok: false,
+        error: "No playable tracks found in snapshot. Expected catalog.songs[*].files.album/a/b.s3Key",
+      });
+    }
+
+    const shareId = crypto.randomBytes(8).toString("hex");
 
     const manifest = {
+      ok: true,
+      version: 1,
       shareId,
-      album: {
-        id: "album-001",
-        albumName: "Block Radius (Published)",
-        artist: "Block Radius",
-        releaseDate: "2025-12-31",
-        coverUrl: "https://placehold.co/800x800/png?text=Published+Cover",
-        tracks: [
-          { id: "t1", title: "Track 1", previewUrl: "" },
-          { id: "t2", title: "Track 2", previewUrl: "" },
-        ],
-        modes: { album: true, smartBridge: true },
-        perks: { freeNftMp3Mix: true },
-      },
+      projectId: String(projectId),
+      snapshotKey: String(snapshotKey),
+      publishedAt: new Date().toISOString(),
+      trackCount: tracks.length,
+      tracks,
     };
 
-    return res.json({ ok: true, manifest });
+    // Store manifest in R2 under a stable path
+    const manifestKey = `storage/public/publish/${shareId}/manifest.json`;
+    await putJson(manifestKey, manifest);
+
+    res.json({
+      ok: true,
+      shareId,
+      manifestKey,
+      manifestUrl: `/api/publish/${shareId}/manifest`,
+    });
   } catch (err) {
-    console.error("manifest read error:", err);
-    return res.status(500).json({ ok: false, error: "MANIFEST_READ_FAILED" });
+    console.error("publish-minisite error:", err);
+    res.status(500).json({ ok: false, error: err?.message || String(err) });
+  }
+});
+
+// =======================================================
+// READ-ONLY manifest endpoint (Option 1)
+// GET /api/publish/:shareId/manifest
+// =======================================================
+app.get("/api/publish/:shareId/manifest", async (req, res) => {
+  try {
+    const { shareId } = req.params;
+    const key = `storage/public/publish/${shareId}/manifest.json`;
+
+    const manifest = await getJson(key);
+    if (!manifest) {
+      return res.status(404).json({ ok: false, error: "MANIFEST_NOT_FOUND", shareId });
+    }
+
+    res.json({ ok: true, manifest });
+  } catch (err) {
+    console.error("publish manifest read error:", err);
+    res.status(500).json({ ok: false, error: err?.message || String(err) });
   }
 });
 
