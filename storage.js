@@ -1,103 +1,111 @@
 // storage.js
-const { S3Client, PutObjectCommand, GetObjectCommand } = require("@aws-sdk/client-s3");
+const {
+  S3Client,
+  PutObjectCommand,
+  GetObjectCommand,
+} = require("@aws-sdk/client-s3");
 
-const ACCOUNT_ID = process.env.R2_ACCOUNT_ID || process.env.CLOUDFLARE_ACCOUNT_ID;
-const ACCESS_KEY_ID = process.env.R2_ACCESS_KEY_ID || process.env.AWS_ACCESS_KEY_ID;
-const SECRET_ACCESS_KEY = process.env.R2_SECRET_ACCESS_KEY || process.env.AWS_SECRET_ACCESS_KEY;
-const BUCKET = process.env.R2_BUCKET || process.env.AWS_S3_BUCKET || process.env.S3_BUCKET;
+// ---------- ENV ----------
+const BUCKET =
+  process.env.AWS_S3_BUCKET ||
+  process.env.S3_BUCKET ||
+  process.env.R2_BUCKET;
 
-// R2 endpoint example:
-// https://<ACCOUNT_ID>.r2.cloudflarestorage.com
-const ENDPOINT =
-  process.env.R2_ENDPOINT ||
-  (ACCOUNT_ID ? `https://${ACCOUNT_ID}.r2.cloudflarestorage.com` : null);
+const REGION =
+  process.env.AWS_REGION ||
+  process.env.AWS_DEFAULT_REGION ||
+  "auto"; // R2 uses "auto"
 
-function r2Configured() {
-  return Boolean(ENDPOINT && ACCESS_KEY_ID && SECRET_ACCESS_KEY && BUCKET);
+const ENDPOINT = process.env.AWS_ENDPOINT || process.env.R2_ENDPOINT;
+
+// ---------- CLIENT ----------
+if (!BUCKET) {
+  console.warn("⚠️ storage.js: BUCKET env var missing");
 }
 
-function getClient() {
-  if (!r2Configured()) return null;
+const s3 = new S3Client({
+  region: REGION,
+  endpoint: ENDPOINT,
+  credentials: process.env.AWS_ACCESS_KEY_ID
+    ? {
+        accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+        secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
+      }
+    : undefined, // Render IAM / R2 bindings
+});
 
-  return new S3Client({
-    region: "auto",
-    endpoint: ENDPOINT,
-    credentials: {
-      accessKeyId: ACCESS_KEY_ID,
-      secretAccessKey: SECRET_ACCESS_KEY,
-    },
-  });
+// ---------- HELPERS ----------
+async function putJson(key, data) {
+  if (!key) throw new Error("putJson: missing key");
+
+  const body = Buffer.from(JSON.stringify(data, null, 2));
+
+  await s3.send(
+    new PutObjectCommand({
+      Bucket: BUCKET,
+      Key: key,
+      Body: body,
+      ContentType: "application/json; charset=utf-8",
+      CacheControl: "no-store",
+    })
+  );
+
+  return { ok: true, key };
 }
 
-// --- helpers to read GetObject body ---
-async function streamToString(stream) {
-  return await new Promise((resolve, reject) => {
-    const chunks = [];
-    stream.on("data", (c) => chunks.push(c));
-    stream.on("end", () => resolve(Buffer.concat(chunks).toString("utf-8")));
-    stream.on("error", reject);
-  });
+async function getJson(key) {
+  if (!key) throw new Error("getJson: missing key");
+
+  try {
+    const out = await s3.send(
+      new GetObjectCommand({
+        Bucket: BUCKET,
+        Key: key,
+      })
+    );
+
+    const text = await streamToString(out.Body);
+    return JSON.parse(text);
+  } catch (err) {
+    if (err?.$metadata?.httpStatusCode === 404) {
+      throw new Error("JSON_NOT_FOUND");
+    }
+    throw err;
+  }
 }
 
-// ✅ Upload any file buffer to R2
-async function saveFileToR2({ key, contentType, body }) {
-  const client = getClient();
-  if (!client) throw new Error("R2 credentials are missing! Check env vars.");
+async function saveFileToR2({ key, body, contentType }) {
+  if (!key) throw new Error("saveFileToR2: missing key");
+  if (!body) throw new Error("saveFileToR2: missing body");
 
-  await client.send(
+  await s3.send(
     new PutObjectCommand({
       Bucket: BUCKET,
       Key: key,
       Body: body,
       ContentType: contentType || "application/octet-stream",
-      CacheControl: "no-store, max-age=0",
+      CacheControl: "no-store",
     })
   );
 
-  // Public URL depends on your setup; backend doesn’t need it for master-save.
-  return { ok: true, key };
+  return key;
 }
 
-// ✅ Write JSON to R2
-async function putJson(key, obj) {
-  const client = getClient();
-  if (!client) throw new Error("R2 credentials are missing! Check env vars.");
-
-  await client.send(
-    new PutObjectCommand({
-      Bucket: BUCKET,
-      Key: key,
-      Body: Buffer.from(JSON.stringify(obj ?? {}, null, 2)),
-      ContentType: "application/json; charset=utf-8",
-      CacheControl: "no-store, max-age=0",
-    })
-  );
-
-  return { ok: true, key };
+// ---------- STREAM UTILS ----------
+function streamToString(stream) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    stream.on("data", (chunk) => chunks.push(chunk));
+    stream.on("error", reject);
+    stream.on("end", () =>
+      resolve(Buffer.concat(chunks).toString("utf-8"))
+    );
+  });
 }
 
-// ✅ READ JSON from R2  (THIS IS WHAT YOU WERE MISSING)
-async function getJson(key) {
-  const client = getClient();
-  if (!client) throw new Error("R2 credentials are missing! Check env vars.");
-
-  const out = await client.send(
-    new GetObjectCommand({
-      Bucket: BUCKET,
-      Key: key,
-    })
-  );
-
-  const raw = await streamToString(out.Body);
-  try {
-    return JSON.parse(raw);
-  } catch (e) {
-    throw new Error(`Invalid JSON at key: ${key}`);
-  }
-}
-
+// ---------- EXPORTS ----------
 module.exports = {
-  saveFileToR2,
   putJson,
   getJson,
+  saveFileToR2,
 };
