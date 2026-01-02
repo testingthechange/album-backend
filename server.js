@@ -7,8 +7,8 @@ const crypto = require("crypto");
 
 const upload = multer({ storage: multer.memoryStorage() });
 
-// ✅ IMPORTANT: storage must export getJson + putJson (and saveFileToR2 if used)
-const { saveFileToR2, putJson, getJson } = require("./storage");
+// ✅ IMPORTANT: storage must export getJson + putJson (+ saveFileToR2 + presignGet)
+const { saveFileToR2, putJson, getJson, presignGet } = require("./storage");
 
 const app = express();
 const port = process.env.PORT || 3000;
@@ -210,6 +210,23 @@ app.get("/api/master-save/latest/:projectId", async (req, res) => {
   }
 });
 
+// ---------- PLAYBACK URL (TURN s3Key INTO PLAYABLE URL) ----------
+// Frontend will call this for published manifest tracks
+app.get("/api/playback-url", async (req, res) => {
+  try {
+    const s3Key = String(req.query.s3Key || "").trim();
+    if (!s3Key) return res.status(400).json({ ok: false, error: "Missing s3Key" });
+
+    // presignGet comes from storage.js (works for R2/S3 depending on env)
+    const url = await presignGet(s3Key, 60 * 20);
+
+    return res.json({ ok: true, url });
+  } catch (err) {
+    console.error("playback-url error:", err);
+    return res.status(500).json({ ok: false, error: err?.message || String(err) });
+  }
+});
+
 // =======================================================
 // PUBLISH MINI SITE (shareId-based manifest)
 // POST /api/publish-minisite
@@ -232,16 +249,13 @@ function extractTracksFromProject(project) {
       const slot = Number(s?.songNumber || s?.slot || (idx + 1));
 
       // title can be title, or titleJson.title, or fallback
-      const title =
-        safeStr(s?.title) ||
-        safeStr(s?.titleJson?.title) ||
-        `Track ${slot}`;
+      const title = safeStr(s?.title) || safeStr(s?.titleJson?.title) || `Track ${slot}`;
 
-      // ✅ Your real schema: versions.A/B.s3Key (these exist in your snapshot)
+      // ✅ Your real schema: versions.A/B.s3Key
       const vA = safeStr(s?.versions?.A?.s3Key);
       const vB = safeStr(s?.versions?.B?.s3Key);
 
-      // Legacy schema support: files.album/a/b.s3Key
+      // Legacy schema: files.album/a/b.s3Key
       const albumKey = safeStr(s?.files?.album?.s3Key);
       const aKey = safeStr(s?.files?.a?.s3Key);
       const bKey = safeStr(s?.files?.b?.s3Key);
@@ -263,7 +277,7 @@ app.post("/api/publish-minisite", async (req, res) => {
 
     const snapWrap = await getJson(snapshotKey);
 
-    // Your master-save wrapper shape is { projectId, createdAt, source, data: project }
+    // master-save wrapper: { projectId, createdAt, source, data: project }
     const project = snapWrap?.data || snapWrap?.project || snapWrap?.snapshot || null;
     if (!project || typeof project !== "object") {
       return res.status(400).json({ ok: false, error: "Snapshot invalid or missing project data" });
@@ -289,7 +303,7 @@ app.post("/api/publish-minisite", async (req, res) => {
       snapshotKey: String(snapshotKey),
       publishedAt: new Date().toISOString(),
       trackCount: tracks.length,
-      tracks,
+      tracks, // tracks contain s3Key only; frontend uses /api/playback-url to play
     };
 
     await putJson(manifestKey, manifest);
