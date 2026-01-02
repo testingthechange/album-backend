@@ -7,11 +7,11 @@ const crypto = require("crypto");
 
 const upload = multer({ storage: multer.memoryStorage() });
 
-// storage exports: getJson, putJson, presignGetUrl, saveFileToR2
+// ✅ storage exports
 const { saveFileToR2, putJson, getJson, presignGetUrl } = require("./storage");
 
 const app = express();
-const port = process.env.PORT || 3000;
+const port = process.env.PORT || 10000;
 
 // ---------- CORS ----------
 const ALLOWED_ORIGINS = [
@@ -54,17 +54,17 @@ app.get("/api/health", async (req, res) => {
   }
 });
 
-// ---------- publish-proof ----------
+// ---------- PROOF ----------
 app.get("/api/publish-proof", (req, res) => {
   res.json({
     ok: true,
-    proof: "publish-proof-v1-album-backend",
+    proof: "publish-proof-v2-compat",
     commit: process.env.RENDER_GIT_COMMIT || "unknown",
     deployedAt: process.env.RENDER_DEPLOYED_AT || "unknown",
   });
 });
 
-// ---------- version ----------
+// ---------- VERSION ----------
 app.get("/api/version", (req, res) => {
   res.json({
     ok: true,
@@ -123,7 +123,7 @@ app.get("/api/projects/:projectId/meta", async (req, res) => {
   }
 });
 
-// ---------- MP3 UPLOAD → S3/R2 ----------
+// ---------- MP3 UPLOAD ----------
 app.post(
   "/api/projects/:projectId/songs/:songId/upload",
   upload.single("file"),
@@ -145,7 +145,7 @@ app.post(
 
       res.json({ ok: true, url });
     } catch (err) {
-      console.error("R2/S3 upload failed", err);
+      console.error("upload failed", err);
       res.status(500).json({ ok: false, error: "UPLOAD_FAILED" });
     }
   }
@@ -156,9 +156,7 @@ app.post("/api/master-save", async (req, res) => {
   try {
     const { projectId, project } = req.body || {};
     if (!projectId || !project) {
-      return res
-        .status(400)
-        .json({ ok: false, error: "Missing projectId or project" });
+      return res.status(400).json({ ok: false, error: "Missing projectId or project" });
     }
 
     const now = new Date().toISOString();
@@ -204,7 +202,6 @@ app.get("/api/master-save/latest/:projectId", async (req, res) => {
     }
 
     const snapshot = await getJson(latest.latestSnapshotKey);
-
     res.json({ ok: true, latestKey, latest, snapshot });
   } catch (err) {
     console.error("master-save latest error:", err);
@@ -212,16 +209,7 @@ app.get("/api/master-save/latest/:projectId", async (req, res) => {
   }
 });
 
-// =======================================================
-// PUBLISH MINI SITE (shareId-based manifest)
-// POST /api/publish-minisite
-// body: { projectId, snapshotKey }
-// - reads snapshot JSON (getJson)
-// - extracts tracks from snapshot (supports versions.A/B + files.album/a/b)
-// - presigns urls (or uses PUBLIC_FILES_BASE_URL if set)
-// - stores manifest at: public/players/<shareId>/manifest.json
-// - returns shareId + manifestKey + manifestUrl
-// =======================================================
+// ---------- PUBLISH HELPERS ----------
 function safeStr(v) {
   return String(v ?? "").trim();
 }
@@ -231,25 +219,19 @@ function extractTracksFromProject(project) {
 
   return songs
     .map((s, idx) => {
-      // slot can be songNumber (real schema) or slot or fallback index+1
       const slot = Number(s?.songNumber || s?.slot || idx + 1);
-
-      // title can be title, or titleJson.title, or fallback
       const title =
         safeStr(s?.title) ||
         safeStr(s?.titleJson?.title) ||
         `Track ${slot}`;
 
-      // real schema: versions.A/B.s3Key
       const vA = safeStr(s?.versions?.A?.s3Key);
       const vB = safeStr(s?.versions?.B?.s3Key);
 
-      // legacy schema support: files.album/a/b.s3Key
       const albumKey = safeStr(s?.files?.album?.s3Key);
       const aKey = safeStr(s?.files?.a?.s3Key);
       const bKey = safeStr(s?.files?.b?.s3Key);
 
-      // prefer albumKey, then versions A/B, then a/b
       const s3Key = albumKey || vA || vB || aKey || bKey;
 
       return s3Key ? { slot, title, s3Key } : null;
@@ -257,23 +239,19 @@ function extractTracksFromProject(project) {
     .filter(Boolean);
 }
 
+// ---------- PUBLISH MINI SITE ----------
 app.post("/api/publish-minisite", async (req, res) => {
   try {
     const { projectId, snapshotKey } = req.body || {};
     if (!projectId || !snapshotKey) {
-      return res
-        .status(400)
-        .json({ ok: false, error: "Missing projectId or snapshotKey" });
+      return res.status(400).json({ ok: false, error: "Missing projectId or snapshotKey" });
     }
 
     const snapWrap = await getJson(snapshotKey);
+    const project = snapWrap?.data || snapWrap?.project || snapWrap?.snapshot || null;
 
-    // wrapper shape can be { data: project } OR already a project-ish object
-    const project = snapWrap?.data || snapWrap?.project || snapWrap?.snapshot || snapWrap || null;
     if (!project || typeof project !== "object") {
-      return res
-        .status(400)
-        .json({ ok: false, error: "Snapshot invalid or missing project data" });
+      return res.status(400).json({ ok: false, error: "Snapshot invalid or missing project data" });
     }
 
     const tracks = extractTracksFromProject(project);
@@ -285,7 +263,7 @@ app.post("/api/publish-minisite", async (req, res) => {
       });
     }
 
-    // add presigned URLs so the frontend can actually play different songs
+    // ✅ add presigned URLs (or public URLs) so frontend can play
     const tracksWithUrls = [];
     for (const t of tracks) {
       const url = await presignGetUrl(t.s3Key, 60 * 20);
@@ -321,10 +299,11 @@ app.post("/api/publish-minisite", async (req, res) => {
 });
 
 // =======================================================
+// ✅ COMPAT ENDPOINT
 // GET /api/publish/:shareId/manifest
-// IMPORTANT: return BOTH shapes:
-//  1) top-level { ok, tracks } (new client)
-//  2) { manifest: { album: ... } } (older deployed blackout-web expects manifest.album)
+// Returns BOTH formats:
+// 1) New: { ok, tracks, ... }
+// 2) Old: { manifest: { album: {...} } }
 // =======================================================
 app.get("/api/publish/:shareId/manifest", async (req, res) => {
   try {
@@ -338,42 +317,30 @@ app.get("/api/publish/:shareId/manifest", async (req, res) => {
       return res.status(404).json({ ok: false, error: "MANIFEST_NOT_FOUND", shareId });
     }
 
-    const tracks = Array.isArray(stored.tracks) ? stored.tracks : [];
-
-    // Legacy wrapper (minified blackout-web is checking A.manifest.album)
-    const album = {
-      id: `published-${stored.shareId || shareId}`,
+    // ✅ Build legacy wrapper that blackout-web old build expects:
+    // expects: { ok:true, manifest: { album: {...} } }
+    const legacyAlbum = {
+      id: `published-${stored.shareId}`,
       albumName: "Published Album",
       artist: "Smart Bridge",
-      coverUrl: "https://placehold.co/600x600/png?text=cover",
+      coverUrl: "", // leave blank; frontend can still show fallback cover
       releaseDate: stored.publishedAt ? String(stored.publishedAt).slice(0, 10) : "—",
-      shareId: stored.shareId || shareId,
-      isPublished: true,
-      tracks: tracks.map((t, i) => ({
-        id: `pub-${stored.shareId || shareId}-${i}`,
+      tracks: (stored.tracks || []).map((t, i) => ({
+        id: `pub-${stored.shareId}-${i}`,
         title: t.title || `Track ${i + 1}`,
         url: t.url || "",
         previewUrl: t.url || "",
         s3Key: t.s3Key || "",
         slot: t.slot || i + 1,
       })),
+      isPublished: true,
+      shareId: stored.shareId,
     };
 
-    // ✅ Return BOTH
+    // ✅ respond with BOTH shapes
     res.json({
-      ok: true,
-
-      // raw fields
-      version: stored.version ?? 1,
-      shareId: stored.shareId || shareId,
-      projectId: stored.projectId,
-      snapshotKey: stored.snapshotKey,
-      publishedAt: stored.publishedAt,
-      trackCount: tracks.length,
-      tracks,
-
-      // legacy expected shape
-      manifest: { album },
+      ...stored, // ok, version, shareId, tracks[], etc (top-level)
+      manifest: { album: legacyAlbum }, // legacy wrapper
     });
   } catch (err) {
     console.error("publish manifest error:", err);
