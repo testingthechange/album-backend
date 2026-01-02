@@ -1,5 +1,10 @@
 // storage.js
-const { S3Client, PutObjectCommand, GetObjectCommand } = require("@aws-sdk/client-s3");
+const {
+  S3Client,
+  PutObjectCommand,
+  GetObjectCommand,
+} = require("@aws-sdk/client-s3");
+
 const { getSignedUrl } = require("@aws-sdk/s3-request-presigner");
 
 // ---------- ENV ----------
@@ -13,26 +18,29 @@ const REGION =
   process.env.AWS_DEFAULT_REGION ||
   "auto"; // R2 uses "auto"
 
-const ENDPOINT = process.env.AWS_ENDPOINT || process.env.R2_ENDPOINT;
+const ENDPOINT =
+  process.env.AWS_ENDPOINT ||
+  process.env.R2_ENDPOINT ||
+  undefined;
+
+// If you're using Cloudflare R2, ENDPOINT is required and usually looks like:
+// https://<accountid>.r2.cloudflarestorage.com
+// (or a custom domain if you set one)
+
+if (!BUCKET) console.warn("⚠️ storage.js: BUCKET env var missing");
 
 // ---------- CLIENT ----------
-if (!BUCKET) {
-  console.warn("⚠️ storage.js: BUCKET env var missing");
-}
-if (!ENDPOINT && REGION === "auto") {
-  // not fatal, but usually R2 requires endpoint
-  console.warn("⚠️ storage.js: R2 endpoint missing (R2_ENDPOINT / AWS_ENDPOINT). If using AWS S3, this may be fine.");
-}
-
 const s3 = new S3Client({
   region: REGION,
   endpoint: ENDPOINT,
+  // R2 often needs path-style addressing; S3 generally doesn't mind.
+  forcePathStyle: Boolean(ENDPOINT),
   credentials: process.env.AWS_ACCESS_KEY_ID
     ? {
         accessKeyId: process.env.AWS_ACCESS_KEY_ID,
         secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
       }
-    : undefined, // If you’re using IAM role or platform-provided creds
+    : undefined,
 });
 
 // ---------- STREAM UTILS ----------
@@ -45,7 +53,7 @@ function streamToString(stream) {
   });
 }
 
-// ---------- HELPERS ----------
+// ---------- JSON HELPERS ----------
 async function putJson(key, data) {
   if (!key) throw new Error("putJson: missing key");
 
@@ -78,21 +86,18 @@ async function getJson(key) {
     const text = await streamToString(out.Body);
     return JSON.parse(text);
   } catch (err) {
-    // R2 + AWS SDK sometimes does not give httpStatusCode on NoSuchKey
-    const msg = String(err?.name || err?.Code || err?.message || "");
-    const isNotFound =
-      err?.$metadata?.httpStatusCode === 404 ||
-      msg.includes("NoSuchKey") ||
-      msg.includes("NotFound") ||
-      msg.includes("404");
+    // normalize not-found into a consistent error string
+    const code = err?.name || err?.Code || "";
+    const http = err?.$metadata?.httpStatusCode;
 
-    if (isNotFound) {
+    if (http === 404 || code === "NoSuchKey" || code === "NotFound") {
       throw new Error("JSON_NOT_FOUND");
     }
     throw err;
   }
 }
 
+// ---------- FILE UPLOAD (optional; keeps your existing behavior) ----------
 async function saveFileToR2({ key, body, contentType }) {
   if (!key) throw new Error("saveFileToR2: missing key");
   if (!body) throw new Error("saveFileToR2: missing body");
@@ -107,15 +112,14 @@ async function saveFileToR2({ key, body, contentType }) {
     })
   );
 
-  // Keep behavior consistent with your existing backend
   return key;
 }
 
-// ✅ NEW: presign a GET url for playback
-async function presignGet(key, expiresInSec = 1200) {
-  if (!key) throw new Error("presignGet: missing key");
+// ---------- PRESIGNED GET URL (THIS IS THE MISSING PIECE FOR PLAYBACK) ----------
+async function presignGetUrl(key, expiresInSeconds = 60 * 20) {
+  if (!key) throw new Error("presignGetUrl: missing key");
 
-  const url = await getSignedUrl(
+  return await getSignedUrl(
     s3,
     new GetObjectCommand({
       Bucket: BUCKET,
@@ -123,10 +127,8 @@ async function presignGet(key, expiresInSec = 1200) {
       ResponseCacheControl: "no-store, max-age=0",
       ResponseExpires: new Date(0).toUTCString(),
     }),
-    { expiresIn: Number(expiresInSec) || 1200 }
+    { expiresIn: expiresInSeconds }
   );
-
-  return url;
 }
 
 // ---------- EXPORTS ----------
@@ -134,5 +136,5 @@ module.exports = {
   putJson,
   getJson,
   saveFileToR2,
-  presignGet,
+  presignGetUrl,
 };
