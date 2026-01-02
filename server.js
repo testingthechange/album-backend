@@ -211,24 +211,44 @@ app.get("/api/master-save/latest/:projectId", async (req, res) => {
 });
 
 // =======================================================
-// PUBLISH MINI SITE (Option 1: shareId-based manifest)
+// PUBLISH MINI SITE (shareId-based manifest)
 // POST /api/publish-minisite
 // body: { projectId, snapshotKey }
-// - reads snapshot JSON from R2/S3 (getJson)
-// - extracts tracks from snapshot (basic)
+// - reads snapshot JSON from R2 (getJson)
+// - extracts tracks from snapshot (supports versions.A/B + files.album/a/b)
 // - stores manifest at: public/players/<shareId>/manifest.json
-// - returns shareId + publicUrl-ish pointer + manifestKey
+// - returns shareId + manifestKey + manifestUrl
 // =======================================================
+function safeStr(v) {
+  return String(v ?? "").trim();
+}
+
 function extractTracksFromProject(project) {
   const songs = Array.isArray(project?.catalog?.songs) ? project.catalog.songs : [];
+
   return songs
     .map((s, idx) => {
-      const slot = Number(s?.slot || idx + 1);
-      const title = String(s?.title || `Track ${slot}`).trim();
-      const s3Key =
-        String(s?.files?.album?.s3Key || "").trim() ||
-        String(s?.files?.a?.s3Key || "").trim() ||
-        String(s?.files?.b?.s3Key || "").trim();
+      // slot can be songNumber (your real schema) or slot or fallback index+1
+      const slot = Number(s?.songNumber || s?.slot || (idx + 1));
+
+      // title can be title, or titleJson.title, or fallback
+      const title =
+        safeStr(s?.title) ||
+        safeStr(s?.titleJson?.title) ||
+        `Track ${slot}`;
+
+      // ✅ Your real schema: versions.A/B.s3Key (these exist in your snapshot)
+      const vA = safeStr(s?.versions?.A?.s3Key);
+      const vB = safeStr(s?.versions?.B?.s3Key);
+
+      // Legacy schema support: files.album/a/b.s3Key
+      const albumKey = safeStr(s?.files?.album?.s3Key);
+      const aKey = safeStr(s?.files?.a?.s3Key);
+      const bKey = safeStr(s?.files?.b?.s3Key);
+
+      // Prefer albumKey if present, otherwise versions A/B, otherwise a/b
+      const s3Key = albumKey || vA || vB || aKey || bKey;
+
       return s3Key ? { slot, title, s3Key } : null;
     })
     .filter(Boolean);
@@ -253,7 +273,8 @@ app.post("/api/publish-minisite", async (req, res) => {
     if (!tracks.length) {
       return res.status(400).json({
         ok: false,
-        error: "No playable tracks found in snapshot (expected catalog.songs[*].files.album/a/b.s3Key)",
+        error:
+          "No playable tracks found in snapshot (expected catalog.songs[*].versions.A/B.s3Key or files.album/a/b.s3Key)",
       });
     }
 
@@ -271,10 +292,8 @@ app.post("/api/publish-minisite", async (req, res) => {
       tracks,
     };
 
-    // store manifest JSON in R2/S3
     await putJson(manifestKey, manifest);
 
-    // publicUrl depends on how you serve public/players — for now, return the API manifest endpoint
     res.json({
       ok: true,
       shareId,
@@ -287,7 +306,7 @@ app.post("/api/publish-minisite", async (req, res) => {
   }
 });
 
-// ✅ Option 1 endpoint (read-only): GET /api/publish/:shareId/manifest
+// GET /api/publish/:shareId/manifest
 app.get("/api/publish/:shareId/manifest", async (req, res) => {
   try {
     const shareId = String(req.params.shareId || "").trim();
