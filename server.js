@@ -1,322 +1,127 @@
-// server.js
-const express = require("express");
-const cors = require("cors");
-const { Pool } = require("pg");
-const multer = require("multer");
-const crypto = require("crypto");
+// storage.js (CommonJS)
+// Cloudflare R2 via S3-compatible AWS SDK v3
 
-const upload = multer({ storage: multer.memoryStorage() });
+const { S3Client, PutObjectCommand, GetObjectCommand } = require("@aws-sdk/client-s3");
 
-// storage layer (R2)
-const { saveFileToR2, putJson, getJson } = require("./storage");
+const R2_BUCKET = process.env.R2_BUCKET || process.env.AWS_S3_BUCKET || process.env.S3_BUCKET;
+const R2_ACCOUNT_ID = process.env.R2_ACCOUNT_ID || "";
+const R2_ENDPOINT =
+  process.env.R2_ENDPOINT ||
+  (R2_ACCOUNT_ID ? `https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com` : "");
 
-const app = express();
-const port = process.env.PORT || 3000;
+const ACCESS_KEY_ID = process.env.R2_ACCESS_KEY_ID || process.env.AWS_ACCESS_KEY_ID || "";
+const SECRET_ACCESS_KEY = process.env.R2_SECRET_ACCESS_KEY || process.env.AWS_SECRET_ACCESS_KEY || "";
 
-// ---------- CORS (REQUIRED FOR FRONTEND) ----------
-const ALLOWED_ORIGINS = [
-  "https://blackout-web.onrender.com",
-  "http://localhost:5173",
-  "http://localhost:4173",
-];
+// Optional public base used by saveFileToR2 when you want a public URL.
+// If your bucket is private, you can still return a "r2://" style URL and later presign via backend.
+const PUBLIC_R2_BASE = (process.env.PUBLIC_R2_BASE_URL || "").trim();
 
-app.use(
-  cors({
-    origin: (origin, cb) => {
-      // allow server-to-server + health checks (no Origin header)
-      if (!origin) return cb(null, true);
-      if (ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
-      return cb(new Error(`CORS blocked origin: ${origin}`), false);
+function requireEnv(name, value) {
+  if (!value) throw new Error(`Missing env: ${name}`);
+}
+
+function makeClient() {
+  requireEnv("R2_BUCKET (or AWS_S3_BUCKET/S3_BUCKET)", R2_BUCKET);
+  requireEnv("R2_ENDPOINT (or R2_ACCOUNT_ID)", R2_ENDPOINT);
+  requireEnv("R2_ACCESS_KEY_ID (or AWS_ACCESS_KEY_ID)", ACCESS_KEY_ID);
+  requireEnv("R2_SECRET_ACCESS_KEY (or AWS_SECRET_ACCESS_KEY)", SECRET_ACCESS_KEY);
+
+  return new S3Client({
+    region: "auto",
+    endpoint: R2_ENDPOINT,
+    credentials: {
+      accessKeyId: ACCESS_KEY_ID,
+      secretAccessKey: SECRET_ACCESS_KEY,
     },
-    methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-  })
-);
-
-app.use(express.json());
-
-// ---------- DATABASE ----------
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-});
-
-// ---------- ROOT (frontend ping hits this) ----------
-app.get("/", (req, res) => {
-  res.status(200).send("album-backend OK");
-});
-
-// ---------- VERSION / PROOF (debug routes) ----------
-app.get("/api/version", (req, res) => {
-  res.json({
-    ok: true,
-    service: "album-backend",
-    commit: process.env.RENDER_GIT_COMMIT || "unknown",
-    deployedAt: process.env.RENDER_DEPLOYED_AT || "unknown",
   });
-});
-
-app.get("/api/publish-proof", (req, res) => {
-  res.json({
-    ok: true,
-    proof: "publish-proof-v1-album-backend",
-    commit: process.env.RENDER_GIT_COMMIT || "unknown",
-    deployedAt: process.env.RENDER_DEPLOYED_AT || "unknown",
-  });
-});
-
-// ---------- HEALTH ----------
-app.get("/api/health", async (req, res) => {
-  try {
-    await pool.query("SELECT 1");
-    res.json({ ok: true });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ ok: false });
-  }
-});
-
-// ---------- META ----------
-app.post("/api/projects/:projectId/meta", async (req, res) => {
-  const { projectId } = req.params;
-  const meta = req.body;
-
-  if (!meta || typeof meta !== "object") {
-    return res.status(400).json({ ok: false, error: "NO_META_PAYLOAD" });
-  }
-
-  try {
-    await pool.query(
-      `
-      INSERT INTO project_meta (project_id, meta_json)
-      VALUES ($1, $2)
-      ON CONFLICT (project_id)
-      DO UPDATE SET
-        meta_json = EXCLUDED.meta_json,
-        updated_at = now()
-      `,
-      [projectId, meta]
-    );
-
-    res.json({ ok: true, projectId });
-  } catch (err) {
-    console.error("Error saving meta", err);
-    res.status(500).json({ ok: false, error: "META_SAVE_FAILED" });
-  }
-});
-
-app.get("/api/projects/:projectId/meta", async (req, res) => {
-  const { projectId } = req.params;
-
-  try {
-    const result = await pool.query(
-      `SELECT meta_json FROM project_meta WHERE project_id = $1`,
-      [projectId]
-    );
-
-    if (result.rows.length === 0) {
-      return res.status(404).json({ ok: false, meta: null });
-    }
-
-    res.json({ ok: true, meta: result.rows[0].meta_json });
-  } catch (err) {
-    console.error("Error loading meta", err);
-    res.status(500).json({ ok: false, error: "META_LOAD_FAILED" });
-  }
-});
-
-// ---------- MP3 UPLOAD → R2 ----------
-app.post(
-  "/api/projects/:projectId/songs/:songId/upload",
-  upload.single("file"),
-  async (req, res) => {
-    const { projectId, songId } = req.params;
-
-    if (!req.file) {
-      return res.status(400).json({ ok: false, error: "NO_FILE" });
-    }
-
-    const key = `projects/${projectId}/songs/${songId}/${req.file.originalname}`;
-
-    try {
-      const url = await saveFileToR2({
-        key,
-        contentType: req.file.mimetype,
-        body: req.file.buffer,
-      });
-
-      res.json({ ok: true, url });
-    } catch (err) {
-      console.error("R2 upload failed", err);
-      res.status(500).json({ ok: false, error: "UPLOAD_FAILED" });
-    }
-  }
-);
-
-// =======================================================
-// MASTER SAVE (WRITE)
-// expects { projectId, project }
-// writes:
-//   storage/projects/{projectId}/producer_returns/snapshots/{ts}.json
-//   storage/projects/{projectId}/producer_returns/latest.json
-// =======================================================
-app.post("/api/master-save", async (req, res) => {
-  try {
-    const { projectId, project } = req.body || {};
-    if (!projectId || !project) {
-      return res.status(400).json({ ok: false, error: "Missing projectId or project" });
-    }
-
-    const now = new Date().toISOString();
-    const ts = now.replace(/[:.]/g, "-");
-
-    const snapshotKey = `storage/projects/${projectId}/producer_returns/snapshots/${ts}.json`;
-    const latestKey = `storage/projects/${projectId}/producer_returns/latest.json`;
-
-    await putJson(snapshotKey, {
-      projectId: String(projectId),
-      savedAt: now,
-      project,
-    });
-
-    await putJson(latestKey, {
-      projectId: String(projectId),
-      latestSnapshotKey: snapshotKey,
-      savedAt: now,
-    });
-
-    res.json({ ok: true, snapshotKey, latestKey });
-  } catch (err) {
-    console.error("master-save error:", err);
-    res.status(500).json({ ok: false, error: err?.message || String(err) });
-  }
-});
-
-// =======================================================
-// MASTER SAVE (READ BACK)
-// GET /api/master-save/latest/:projectId
-// =======================================================
-app.get("/api/master-save/latest/:projectId", async (req, res) => {
-  try {
-    const { projectId } = req.params;
-    const latestKey = `storage/projects/${projectId}/producer_returns/latest.json`;
-
-    const latest = await getJson(latestKey);
-    if (!latest || !latest.latestSnapshotKey) {
-      return res.status(404).json({
-        ok: false,
-        error: "NO_LATEST_FOUND",
-        latestKey,
-      });
-    }
-
-    const snapshot = await getJson(latest.latestSnapshotKey);
-    return res.json({ ok: true, latestKey, latest, snapshot });
-  } catch (err) {
-    console.error("master-save latest error:", err);
-    res.status(500).json({ ok: false, error: err?.message || String(err) });
-  }
-});
-
-// =======================================================
-// PUBLISH (Option 1 shareId-based)
-// POST /api/publish-minisite
-// body: { projectId, snapshotKey }
-// writes manifest to:
-//   storage/public/publish/{shareId}/manifest.json
-// =======================================================
-function safeString(v) {
-  return String(v ?? "").trim();
 }
 
-function extractTracksFromSnapshot(snap) {
-  const inner = snap?.project || snap?.snapshot || snap || null;
-  const songs = Array.isArray(inner?.catalog?.songs) ? inner.catalog.songs : [];
+let _client = null;
+function client() {
+  if (!_client) _client = makeClient();
+  return _client;
+}
 
-  return songs
-    .map((s, idx) => {
-      const slot = Number(s?.slot || idx + 1);
-      const title = safeString(s?.title) || `Track ${slot}`;
+async function saveFileToR2({ key, contentType, body }) {
+  if (!key) throw new Error("saveFileToR2: missing key");
+  if (!body) throw new Error("saveFileToR2: missing body");
 
-      // use album s3Key if present
-      const s3Key = safeString(s?.files?.album?.s3Key) || safeString(s?.files?.a?.s3Key) || safeString(s?.files?.b?.s3Key);
-      if (!s3Key) return null;
-
-      return { slot, title, s3Key };
+  await client().send(
+    new PutObjectCommand({
+      Bucket: R2_BUCKET,
+      Key: key,
+      Body: body,
+      ContentType: contentType || "application/octet-stream",
+      CacheControl: "no-store, max-age=0",
     })
-    .filter(Boolean);
+  );
+
+  // If you have a public base (custom domain/CDN), return a usable URL
+  if (PUBLIC_R2_BASE) {
+    const base = PUBLIC_R2_BASE.replace(/\/+$/, "");
+    const safeKey = String(key).replace(/^\/+/, "");
+    return `${base}/${safeKey}`;
+  }
+
+  // Otherwise return a descriptive non-public URL
+  return `r2://${R2_BUCKET}/${key}`;
 }
 
-app.post("/api/publish-minisite", async (req, res) => {
+async function putJson(key, obj) {
+  if (!key) throw new Error("putJson: missing key");
+  const body = Buffer.from(JSON.stringify(obj ?? {}, null, 2));
+  await client().send(
+    new PutObjectCommand({
+      Bucket: R2_BUCKET,
+      Key: key,
+      Body: body,
+      ContentType: "application/json; charset=utf-8",
+      CacheControl: "no-store, max-age=0",
+    })
+  );
+  return { ok: true, key };
+}
+
+async function streamToString(stream) {
+  return await new Promise((resolve, reject) => {
+    const chunks = [];
+    stream.on("data", (c) => chunks.push(Buffer.isBuffer(c) ? c : Buffer.from(c)));
+    stream.on("error", reject);
+    stream.on("end", () => resolve(Buffer.concat(chunks).toString("utf-8")));
+  });
+}
+
+async function getJson(key) {
+  if (!key) throw new Error("getJson: missing key");
+
   try {
-    const { projectId, snapshotKey } = req.body || {};
-    if (!projectId || !snapshotKey) {
-      return res.status(400).json({ ok: false, error: "Missing projectId or snapshotKey" });
-    }
+    const out = await client().send(
+      new GetObjectCommand({
+        Bucket: R2_BUCKET,
+        Key: key,
+      })
+    );
 
-    // read snapshot json
-    const snapWrap = await getJson(snapshotKey);
-    if (!snapWrap || typeof snapWrap !== "object") {
-      return res.status(400).json({ ok: false, error: "Snapshot not found or invalid JSON at snapshotKey" });
-    }
-
-    const tracks = extractTracksFromSnapshot(snapWrap);
-    if (!tracks.length) {
-      return res.status(400).json({
-        ok: false,
-        error: "No playable tracks found in snapshot. Expected catalog.songs[*].files.album/a/b.s3Key",
-      });
-    }
-
-    const shareId = crypto.randomBytes(8).toString("hex");
-
-    const manifest = {
-      ok: true,
-      version: 1,
-      shareId,
-      projectId: String(projectId),
-      snapshotKey: String(snapshotKey),
-      publishedAt: new Date().toISOString(),
-      trackCount: tracks.length,
-      tracks,
-    };
-
-    // Store manifest in R2 under a stable path
-    const manifestKey = `storage/public/publish/${shareId}/manifest.json`;
-    await putJson(manifestKey, manifest);
-
-    res.json({
-      ok: true,
-      shareId,
-      manifestKey,
-      manifestUrl: `/api/publish/${shareId}/manifest`,
-    });
+    if (!out || !out.Body) throw new Error("Missing Body from GetObject");
+    const txt = await streamToString(out.Body);
+    const parsed = JSON.parse(txt);
+    return parsed;
   } catch (err) {
-    console.error("publish-minisite error:", err);
-    res.status(500).json({ ok: false, error: err?.message || String(err) });
+    // Normalize "not found" into null so callers can decide how to respond
+    const msg = String(err?.name || err?.Code || err?.message || err);
+    const isNotFound =
+      msg.includes("NoSuchKey") ||
+      msg.includes("NotFound") ||
+      msg.includes("404") ||
+      msg.includes("The specified key does not exist");
+
+    if (isNotFound) return null;
+    throw err;
   }
-});
+}
 
-// =======================================================
-// READ-ONLY manifest endpoint (Option 1)
-// GET /api/publish/:shareId/manifest
-// =======================================================
-app.get("/api/publish/:shareId/manifest", async (req, res) => {
-  try {
-    const { shareId } = req.params;
-    const key = `storage/public/publish/${shareId}/manifest.json`;
-
-    const manifest = await getJson(key);
-    if (!manifest) {
-      return res.status(404).json({ ok: false, error: "MANIFEST_NOT_FOUND", shareId });
-    }
-
-    res.json({ ok: true, manifest });
-  } catch (err) {
-    console.error("publish manifest read error:", err);
-    res.status(500).json({ ok: false, error: err?.message || String(err) });
-  }
-});
-
-// ---------- START ----------
-app.listen(port, () => {
-  console.log(`album-backend listening on port ${port}`);
-});
+module.exports = {
+  saveFileToR2,
+  putJson,
+  getJson, // ✅ required by /api/master-save/latest/:projectId
+};
