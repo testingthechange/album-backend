@@ -1,10 +1,13 @@
-// server.js — album-backend (AWS S3) — album-only publish + playback-url
+// server.js — album-backend (AWS S3) — album-only publish + playback-url + upload-to-s3
 
 const express = require("express");
 const cors = require("cors");
 const crypto = require("crypto");
+const multer = require("multer");
 
-const { putJson, getJson, presignGetUrl } = require("./storage");
+const upload = multer({ storage: multer.memoryStorage() });
+
+const { putJson, getJson, presignGetUrl, putObjectToS3 } = require("./storage");
 
 const app = express();
 const port = process.env.PORT || 10000;
@@ -14,6 +17,7 @@ app.use(
   cors({
     origin: "*",
     methods: ["GET", "POST", "OPTIONS"],
+    allowedHeaders: ["Content-Type"],
   })
 );
 
@@ -27,6 +31,39 @@ app.get("/api/health", (_req, res) => {
 // ---------- PUBLISH PROOF ----------
 app.get("/api/publish-proof", (_req, res) => {
   res.json({ ok: true, proof: "publish-proof-v1-album-only" });
+});
+
+// =======================================================
+// POST /api/upload-to-s3
+// multipart/form-data with field "file"
+// expects projectId either as:
+//  - form field: projectId
+//  - or query: ?projectId=...
+// writes into: storage/projects/<projectId>/catalog/uploads/<ts>_<rand>_<name>
+// returns: { ok:true, s3Key }
+// =======================================================
+app.post("/api/upload-to-s3", upload.single("file"), async (req, res) => {
+  try {
+    const projectId = String(req.body?.projectId || req.query?.projectId || "").trim();
+    if (!projectId) return res.status(400).json({ ok: false, error: "MISSING_PROJECT_ID" });
+
+    if (!req.file) return res.status(400).json({ ok: false, error: "NO_FILE" });
+
+    const safeName = String(req.file.originalname || "upload.bin").replace(/[^\w.\-]+/g, "_");
+    const rand = crypto.randomBytes(6).toString("hex");
+    const key = `storage/projects/${projectId}/catalog/uploads/${Date.now()}_${rand}_${safeName}`;
+
+    await putObjectToS3({
+      key,
+      body: req.file.buffer,
+      contentType: req.file.mimetype || "application/octet-stream",
+    });
+
+    res.json({ ok: true, s3Key: key });
+  } catch (err) {
+    console.error("upload-to-s3 error:", err);
+    res.status(500).json({ ok: false, error: err?.message || String(err) });
+  }
 });
 
 // =======================================================
@@ -119,21 +156,13 @@ function extractAlbumTracks(project) {
   const albumSongs = Array.isArray(project?.album?.songs) ? project.album.songs : [];
 
   const pickS3Key = (s) => {
-    // Most common
     if (s?.file?.s3Key) return String(s.file.s3Key).trim();
-
-    // Sometimes flattened
     if (s?.s3Key) return String(s.s3Key).trim();
     if (s?.audioS3Key) return String(s.audioS3Key).trim();
     if (s?.audioKey) return String(s.audioKey).trim();
-
-    // Sometimes nested differently
     if (s?.file?.key) return String(s.file.key).trim();
     if (s?.fileKey) return String(s.fileKey).trim();
-
-    // Some builds store uploaded album file info under files.album
     if (s?.files?.album?.s3Key) return String(s.files.album.s3Key).trim();
-
     return "";
   };
 
@@ -141,10 +170,8 @@ function extractAlbumTracks(project) {
     .map((s, idx) => {
       const slot = Number(s?.slot ?? idx + 1);
       const title = String(s?.title || `Track ${slot}`).trim();
-
       const s3Key = pickS3Key(s);
       if (!s3Key) return null;
-
       return { slot, title, s3Key };
     })
     .filter(Boolean);
