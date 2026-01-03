@@ -1,131 +1,112 @@
-// server.js
-const express = require("express");
-const cors = require("cors");
-const crypto = require("crypto");
+// storage.js (Render / R2-backed storage)
+//
+// Required env vars on Render:
+// - R2_ENDPOINT           (e.g. https://<accountid>.r2.cloudflarestorage.com)
+// - R2_ACCESS_KEY_ID
+// - R2_SECRET_ACCESS_KEY
+// - R2_BUCKET
+//
+// Optional:
+// - R2_PUBLIC_BASE_URL    (if you want to build public urls; not required here)
 
-const { putJson, getJson, presignGetUrl } = require("./storage");
+const { S3Client, PutObjectCommand, GetObjectCommand } = require("@aws-sdk/client-s3");
+const { getSignedUrl } = require("@aws-sdk/s3-request-presigner");
 
-const app = express();
-const port = process.env.PORT || 10000;
+const endpoint = process.env.R2_ENDPOINT;
+const accessKeyId = process.env.R2_ACCESS_KEY_ID;
+const secretAccessKey = process.env.R2_SECRET_ACCESS_KEY;
+const bucket = process.env.R2_BUCKET;
 
-// ---------- CORS ----------
-app.use(
-  cors({
-    origin: "*",
-    methods: ["GET", "POST", "OPTIONS"],
-  })
-);
-
-app.use(express.json({ limit: "50mb" }));
-
-// ---------- HEALTH ----------
-app.get("/api/health", (_req, res) => {
-  res.json({ ok: true });
-});
-
-// ---------- PUBLISH PROOF ----------
-app.get("/api/publish-proof", (_req, res) => {
-  res.json({
-    ok: true,
-    proof: "publish-proof-v1-album-only",
-  });
-});
-
-// =======================================================
-// 🔒 ALBUM-ONLY EXTRACTOR (NO FALLBACK)
-// =======================================================
-function extractAlbumTracks(project) {
-  const albumSongs = Array.isArray(project?.album?.songs)
-    ? project.album.songs
-    : [];
-
-  return albumSongs
-    .map((s, idx) => {
-      const slot = Number(s?.slot || idx + 1);
-      const title = String(s?.title || `Track ${slot}`).trim();
-      const s3Key = String(s?.file?.s3Key || "").trim();
-
-      if (!s3Key) return null;
-
-      return { slot, title, s3Key };
-    })
-    .filter(Boolean);
+if (!endpoint || !accessKeyId || !secretAccessKey || !bucket) {
+  // Fail fast, but do not crash on import; callers will see clearer runtime errors.
+  console.warn(
+    "[storage] Missing one or more R2 env vars: R2_ENDPOINT, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET"
+  );
 }
 
-// =======================================================
-// POST /api/publish-minisite
-// =======================================================
-app.post("/api/publish-minisite", async (req, res) => {
+const s3 = new S3Client({
+  region: "auto",
+  endpoint,
+  credentials: { accessKeyId, secretAccessKey },
+});
+
+// ---------- helpers ----------
+function isNotFoundErr(err) {
+  const name = err?.name || "";
+  const code = err?.$metadata?.httpStatusCode;
+  return name === "NoSuchKey" || code === 404;
+}
+
+async function streamToString(stream) {
+  return await new Promise((resolve, reject) => {
+    const chunks = [];
+    stream.on("data", (chunk) => chunks.push(Buffer.from(chunk)));
+    stream.on("error", reject);
+    stream.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
+  });
+}
+
+// ---------- JSON write ----------
+async function putJson(key, obj) {
+  if (!bucket) throw new Error("R2_BUCKET missing");
+  const Body = Buffer.from(JSON.stringify(obj ?? {}, null, 2), "utf8");
+
+  await s3.send(
+    new PutObjectCommand({
+      Bucket: bucket,
+      Key: String(key || "").replace(/^\/+/, ""),
+      Body,
+      ContentType: "application/json; charset=utf-8",
+      CacheControl: "no-store",
+    })
+  );
+
+  return { ok: true, key };
+}
+
+// ---------- JSON read ----------
+async function getJson(key) {
+  if (!bucket) throw new Error("R2_BUCKET missing");
+
+  const Key = String(key || "").replace(/^\/+/, "");
   try {
-    const { projectId, snapshotKey } = req.body || {};
-    if (!projectId || !snapshotKey) {
-      return res.status(400).json({ ok: false, error: "MISSING_INPUT" });
+    const out = await s3.send(
+      new GetObjectCommand({
+        Bucket: bucket,
+        Key,
+      })
+    );
+
+    const text = await streamToString(out.Body);
+    try {
+      return JSON.parse(text);
+    } catch {
+      return null;
     }
-
-    const snap = await getJson(snapshotKey);
-    const project = snap?.data;
-
-    if (!project) {
-      return res.status(400).json({ ok: false, error: "INVALID_SNAPSHOT" });
-    }
-
-    // 🔒 album-only
-    const rawTracks = extractAlbumTracks(project);
-    if (!rawTracks.length) {
-      return res.status(400).json({
-        ok: false,
-        error: "NO_ALBUM_AUDIO_FOUND",
-      });
-    }
-
-    const tracks = [];
-    for (const t of rawTracks) {
-      const url = await presignGetUrl(t.s3Key, 60 * 20);
-      tracks.push({ ...t, url });
-    }
-
-    const shareId = crypto.randomBytes(8).toString("hex");
-    const manifestKey = `public/players/${shareId}/manifest.json`;
-
-    const manifest = {
-      ok: true,
-      version: 1,
-      shareId,
-      projectId,
-      publishedAt: new Date().toISOString(),
-      trackCount: tracks.length,
-      tracks,
-    };
-
-    await putJson(manifestKey, manifest);
-
-    res.json({
-      ok: true,
-      shareId,
-      manifestKey,
-      manifestUrl: `/api/publish/${shareId}/manifest`,
-    });
   } catch (err) {
-    console.error("publish error", err);
-    res.status(500).json({ ok: false, error: String(err) });
+    if (isNotFoundErr(err)) return null;
+    throw err;
   }
-});
+}
 
-// =======================================================
-// GET /api/publish/:shareId/manifest
-// =======================================================
-app.get("/api/publish/:shareId/manifest", async (req, res) => {
-  try {
-    const shareId = req.params.shareId;
-    const key = `public/players/${shareId}/manifest.json`;
-    const manifest = await getJson(key);
-    res.json(manifest);
-  } catch {
-    res.status(404).json({ ok: false, error: "MANIFEST_NOT_FOUND" });
-  }
-});
+// ---------- presign GET url for an R2 object key ----------
+async function presignGetUrl(s3Key, expiresInSeconds = 1200) {
+  if (!bucket) throw new Error("R2_BUCKET missing");
+  const Key = String(s3Key || "").replace(/^\/+/, "");
+  if (!Key) throw new Error("presignGetUrl missing s3Key");
 
-// ---------- START ----------
-app.listen(port, () => {
-  console.log(`album-backend running on ${port}`);
-});
+  return await getSignedUrl(
+    s3,
+    new GetObjectCommand({
+      Bucket: bucket,
+      Key,
+    }),
+    { expiresIn: Number(expiresInSeconds) || 1200 }
+  );
+}
+
+module.exports = {
+  putJson,
+  getJson,
+  presignGetUrl,
+};
