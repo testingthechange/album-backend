@@ -1,162 +1,42 @@
-// server.js
+// server.js — album-backend (AWS S3) — album-only publish
+
 const express = require("express");
 const cors = require("cors");
-const { Pool } = require("pg");
-const multer = require("multer");
 const crypto = require("crypto");
 
-const upload = multer({ storage: multer.memoryStorage() });
-
-// ✅ storage exports
-const { saveFileToR2, putJson, getJson, presignGetUrl } = require("./storage");
+const { putJson, getJson, presignGetUrl } = require("./storage");
 
 const app = express();
 const port = process.env.PORT || 10000;
 
 // ---------- CORS ----------
-const ALLOWED_ORIGINS = [
-  "https://blackout-web.onrender.com",
-  "http://localhost:5173",
-  "http://localhost:4173",
-];
-
 app.use(
   cors({
-    origin: (origin, cb) => {
-      if (!origin) return cb(null, true);
-      if (ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
-      return cb(new Error(`CORS blocked origin: ${origin}`), false);
-    },
-    methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    origin: "*",
+    methods: ["GET", "POST", "OPTIONS"],
   })
 );
 
-app.use(express.json({ limit: process.env.JSON_LIMIT || "60mb" }));
-
-// ---------- DATABASE ----------
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-});
-
-// ---------- ROOT ----------
-app.get("/", (req, res) => {
-  res.status(200).send("album-backend OK");
-});
+app.use(express.json({ limit: "50mb" }));
 
 // ---------- HEALTH ----------
-app.get("/api/health", async (req, res) => {
-  try {
-    await pool.query("SELECT 1");
-    res.json({ ok: true });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ ok: false });
-  }
+app.get("/api/health", (_req, res) => {
+  res.json({ ok: true });
 });
 
-// ---------- PROOF ----------
-app.get("/api/publish-proof", (req, res) => {
-  res.json({
-    ok: true,
-    proof: "publish-proof-v2-compat",
-    commit: process.env.RENDER_GIT_COMMIT || "unknown",
-    deployedAt: process.env.RENDER_DEPLOYED_AT || "unknown",
-  });
+// ---------- PUBLISH PROOF ----------
+app.get("/api/publish-proof", (_req, res) => {
+  res.json({ ok: true, proof: "publish-proof-v1-album-only" });
 });
 
-// ---------- VERSION ----------
-app.get("/api/version", (req, res) => {
-  res.json({
-    ok: true,
-    service: "album-backend",
-    commit: process.env.RENDER_GIT_COMMIT || "unknown",
-    deployedAt: process.env.RENDER_DEPLOYED_AT || "unknown",
-  });
-});
-
-// ---------- META ----------
-app.post("/api/projects/:projectId/meta", async (req, res) => {
-  const { projectId } = req.params;
-  const meta = req.body;
-
-  if (!meta || typeof meta !== "object") {
-    return res.status(400).json({ ok: false, error: "NO_META_PAYLOAD" });
-  }
-
-  try {
-    await pool.query(
-      `
-      INSERT INTO project_meta (project_id, meta_json)
-      VALUES ($1, $2)
-      ON CONFLICT (project_id)
-      DO UPDATE SET
-        meta_json = EXCLUDED.meta_json,
-        updated_at = now()
-      `,
-      [projectId, meta]
-    );
-
-    res.json({ ok: true, projectId });
-  } catch (err) {
-    console.error("Error saving meta", err);
-    res.status(500).json({ ok: false, error: "META_SAVE_FAILED" });
-  }
-});
-
-app.get("/api/projects/:projectId/meta", async (req, res) => {
-  const { projectId } = req.params;
-
-  try {
-    const result = await pool.query(
-      `SELECT meta_json FROM project_meta WHERE project_id = $1`,
-      [projectId]
-    );
-
-    if (result.rows.length === 0) {
-      return res.status(404).json({ ok: false, meta: null });
-    }
-
-    res.json({ ok: true, meta: result.rows[0].meta_json });
-  } catch (err) {
-    console.error("Error loading meta", err);
-    res.status(500).json({ ok: false, error: "META_LOAD_FAILED" });
-  }
-});
-
-// ---------- MP3 UPLOAD ----------
-app.post(
-  "/api/projects/:projectId/songs/:songId/upload",
-  upload.single("file"),
-  async (req, res) => {
-    const { projectId, songId } = req.params;
-
-    if (!req.file) {
-      return res.status(400).json({ ok: false, error: "NO_FILE" });
-    }
-
-    const key = `projects/${projectId}/songs/${songId}/${req.file.originalname}`;
-
-    try {
-      const url = await saveFileToR2({
-        key,
-        contentType: req.file.mimetype,
-        body: req.file.buffer,
-      });
-
-      res.json({ ok: true, url });
-    } catch (err) {
-      console.error("upload failed", err);
-      res.status(500).json({ ok: false, error: "UPLOAD_FAILED" });
-    }
-  }
-);
-
-// ---------- MASTER SAVE (WRITE) ----------
+// =======================================================
+// MASTER SAVE (writes snapshot + latest pointer)
+// =======================================================
 app.post("/api/master-save", async (req, res) => {
   try {
     const { projectId, project } = req.body || {};
     if (!projectId || !project) {
-      return res.status(400).json({ ok: false, error: "Missing projectId or project" });
+      return res.status(400).json({ ok: false, error: "MISSING_PROJECT" });
     }
 
     const now = new Date().toISOString();
@@ -185,23 +65,29 @@ app.post("/api/master-save", async (req, res) => {
   }
 });
 
-// ---------- MASTER SAVE (READ LATEST) ----------
+// =======================================================
+// MASTER SAVE LATEST (reads latest pointer + snapshot)
+// GET /api/master-save/latest/:projectId
+// =======================================================
 app.get("/api/master-save/latest/:projectId", async (req, res) => {
   try {
     const { projectId } = req.params;
     const latestKey = `storage/projects/${projectId}/producer_returns/latest.json`;
 
     const latest = await getJson(latestKey);
-    if (!latest?.latestSnapshotKey) {
-      return res.status(404).json({
-        ok: false,
-        error: "NO_LATEST_FOUND",
-        hint: "POST /api/master-save first to create latest.json",
-        latestKey,
-      });
+    const snapKey =
+      String(latest?.latestSnapshotKey || "").trim() ||
+      String(latest?.snapshotKey || "").trim();
+
+    if (!snapKey) {
+      return res.status(404).json({ ok: false, error: "NO_LATEST_SNAPSHOT_KEY", latestKey });
     }
 
-    const snapshot = await getJson(latest.latestSnapshotKey);
+    const snapshot = await getJson(snapKey);
+    if (!snapshot) {
+      return res.status(404).json({ ok: false, error: "SNAPSHOT_NOT_FOUND", snapKey });
+    }
+
     res.json({ ok: true, latestKey, latest, snapshot });
   } catch (err) {
     console.error("master-save latest error:", err);
@@ -209,65 +95,74 @@ app.get("/api/master-save/latest/:projectId", async (req, res) => {
   }
 });
 
-// ---------- PUBLISH HELPERS ----------
-function safeStr(v) {
-  return String(v ?? "").trim();
-}
+// =======================================================
+// 🔒 ALBUM-ONLY EXTRACTOR (keeps album order)
+// =======================================================
+function extractAlbumTracks(project) {
+  const albumSongs = Array.isArray(project?.album?.songs) ? project.album.songs : [];
 
-function extractTracksFromProject(project) {
-  const songs = Array.isArray(project?.catalog?.songs) ? project.catalog.songs : [];
+  const pickS3Key = (s) => {
+    // Most common
+    if (s?.file?.s3Key) return String(s.file.s3Key).trim();
 
-  return songs
+    // Sometimes flattened
+    if (s?.s3Key) return String(s.s3Key).trim();
+    if (s?.audioS3Key) return String(s.audioS3Key).trim();
+    if (s?.audioKey) return String(s.audioKey).trim();
+
+    // Sometimes nested differently
+    if (s?.file?.key) return String(s.file.key).trim();
+    if (s?.fileKey) return String(s.fileKey).trim();
+
+    // Some builds store uploaded album file info under files.album
+    if (s?.files?.album?.s3Key) return String(s.files.album.s3Key).trim();
+
+    return "";
+  };
+
+  return albumSongs
     .map((s, idx) => {
-      const slot = Number(s?.songNumber || s?.slot || idx + 1);
-      const title =
-        safeStr(s?.title) ||
-        safeStr(s?.titleJson?.title) ||
-        `Track ${slot}`;
+      const slot = Number(s?.slot ?? idx + 1);
+      const title = String(s?.title || `Track ${slot}`).trim();
 
-      const vA = safeStr(s?.versions?.A?.s3Key);
-      const vB = safeStr(s?.versions?.B?.s3Key);
+      const s3Key = pickS3Key(s);
+      if (!s3Key) return null;
 
-      const albumKey = safeStr(s?.files?.album?.s3Key);
-      const aKey = safeStr(s?.files?.a?.s3Key);
-      const bKey = safeStr(s?.files?.b?.s3Key);
-
-      const s3Key = albumKey || vA || vB || aKey || bKey;
-
-      return s3Key ? { slot, title, s3Key } : null;
+      return { slot, title, s3Key };
     })
     .filter(Boolean);
 }
 
-// ---------- PUBLISH MINI SITE ----------
+// =======================================================
+// POST /api/publish-minisite (ALBUM MODE ONLY)
+// =======================================================
 app.post("/api/publish-minisite", async (req, res) => {
   try {
     const { projectId, snapshotKey } = req.body || {};
     if (!projectId || !snapshotKey) {
-      return res.status(400).json({ ok: false, error: "Missing projectId or snapshotKey" });
+      return res.status(400).json({ ok: false, error: "MISSING_INPUT" });
     }
 
-    const snapWrap = await getJson(snapshotKey);
-    const project = snapWrap?.data || snapWrap?.project || snapWrap?.snapshot || null;
+    const snap = await getJson(snapshotKey);
+    const project = snap?.data;
 
-    if (!project || typeof project !== "object") {
-      return res.status(400).json({ ok: false, error: "Snapshot invalid or missing project data" });
+    if (!project) {
+      return res.status(400).json({ ok: false, error: "INVALID_SNAPSHOT" });
     }
 
-    const tracks = extractTracksFromProject(project);
-    if (!tracks.length) {
+    const rawTracks = extractAlbumTracks(project);
+    if (!rawTracks.length) {
       return res.status(400).json({
         ok: false,
-        error:
-          "No playable tracks found (expected catalog.songs[*].versions.A/B.s3Key or files.album/a/b.s3Key)",
+        error: "NO_ALBUM_AUDIO_FOUND",
+        hint: "Expected album.songs[*] to include an s3Key (e.g. song.file.s3Key)",
       });
     }
 
-    // ✅ add presigned URLs (or public URLs) so frontend can play
-    const tracksWithUrls = [];
-    for (const t of tracks) {
+    const tracks = [];
+    for (const t of rawTracks) {
       const url = await presignGetUrl(t.s3Key, 60 * 20);
-      tracksWithUrls.push({ ...t, url });
+      tracks.push({ ...t, url });
     }
 
     const shareId = crypto.randomBytes(8).toString("hex");
@@ -276,12 +171,12 @@ app.post("/api/publish-minisite", async (req, res) => {
     const manifest = {
       ok: true,
       version: 1,
+      mode: "album",
       shareId,
-      projectId: String(projectId),
-      snapshotKey: String(snapshotKey),
+      projectId,
       publishedAt: new Date().toISOString(),
-      trackCount: tracksWithUrls.length,
-      tracks: tracksWithUrls,
+      trackCount: tracks.length,
+      tracks,
     };
 
     await putJson(manifestKey, manifest);
@@ -291,64 +186,34 @@ app.post("/api/publish-minisite", async (req, res) => {
       shareId,
       manifestKey,
       manifestUrl: `/api/publish/${shareId}/manifest`,
+      publicUrl: `https://blackout-web.onrender.com/shop/product/${shareId}`,
     });
   } catch (err) {
-    console.error("publish-minisite error:", err);
+    console.error("publish error", err);
     res.status(500).json({ ok: false, error: err?.message || String(err) });
   }
 });
 
 // =======================================================
-// ✅ COMPAT ENDPOINT
 // GET /api/publish/:shareId/manifest
-// Returns BOTH formats:
-// 1) New: { ok, tracks, ... }
-// 2) Old: { manifest: { album: {...} } }
 // =======================================================
 app.get("/api/publish/:shareId/manifest", async (req, res) => {
   try {
-    const shareId = String(req.params.shareId || "").trim();
-    if (!shareId) return res.status(400).json({ ok: false, error: "MISSING_SHARE_ID" });
+    const shareId = req.params.shareId;
+    const key = `public/players/${shareId}/manifest.json`;
+    const manifest = await getJson(key);
 
-    const manifestKey = `public/players/${shareId}/manifest.json`;
-    const stored = await getJson(manifestKey);
-
-    if (!stored) {
-      return res.status(404).json({ ok: false, error: "MANIFEST_NOT_FOUND", shareId });
+    if (!manifest) {
+      return res.status(404).json({ ok: false, error: "MANIFEST_NOT_FOUND" });
     }
 
-    // ✅ Build legacy wrapper that blackout-web old build expects:
-    // expects: { ok:true, manifest: { album: {...} } }
-    const legacyAlbum = {
-      id: `published-${stored.shareId}`,
-      albumName: "Published Album",
-      artist: "Smart Bridge",
-      coverUrl: "", // leave blank; frontend can still show fallback cover
-      releaseDate: stored.publishedAt ? String(stored.publishedAt).slice(0, 10) : "—",
-      tracks: (stored.tracks || []).map((t, i) => ({
-        id: `pub-${stored.shareId}-${i}`,
-        title: t.title || `Track ${i + 1}`,
-        url: t.url || "",
-        previewUrl: t.url || "",
-        s3Key: t.s3Key || "",
-        slot: t.slot || i + 1,
-      })),
-      isPublished: true,
-      shareId: stored.shareId,
-    };
-
-    // ✅ respond with BOTH shapes
-    res.json({
-      ...stored, // ok, version, shareId, tracks[], etc (top-level)
-      manifest: { album: legacyAlbum }, // legacy wrapper
-    });
+    res.json(manifest);
   } catch (err) {
-    console.error("publish manifest error:", err);
     res.status(500).json({ ok: false, error: err?.message || String(err) });
   }
 });
 
 // ---------- START ----------
 app.listen(port, () => {
-  console.log(`album-backend listening on port ${port}`);
+  console.log(`album-backend running on ${port}`);
 });
