@@ -1,4 +1,4 @@
-// server.js — album-backend (AWS S3) — album-only publish
+// server.js — album-backend (AWS S3) — album-only publish + playback-url
 
 const express = require("express");
 const cors = require("cors");
@@ -27,6 +27,23 @@ app.get("/api/health", (_req, res) => {
 // ---------- PUBLISH PROOF ----------
 app.get("/api/publish-proof", (_req, res) => {
   res.json({ ok: true, proof: "publish-proof-v1-album-only" });
+});
+
+// =======================================================
+// GET /api/playback-url?s3Key=...
+// returns a short-lived signed URL to play an S3 object
+// =======================================================
+app.get("/api/playback-url", async (req, res) => {
+  try {
+    const s3Key = String(req.query?.s3Key || "").trim();
+    if (!s3Key) return res.status(400).json({ ok: false, error: "MISSING_S3KEY" });
+
+    const url = await presignGetUrl(s3Key, 60 * 20); // 20 minutes
+    res.json({ ok: true, s3Key, url });
+  } catch (err) {
+    console.error("playback-url error:", err);
+    res.status(500).json({ ok: false, error: err?.message || String(err) });
+  }
 });
 
 // =======================================================
