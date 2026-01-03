@@ -1,86 +1,50 @@
-// storage.js — AWS S3 backed storage (Render)
+// storage.js — AWS S3-backed JSON + file storage + presigned GET
 
 const { S3Client, PutObjectCommand, GetObjectCommand } = require("@aws-sdk/client-s3");
 const { getSignedUrl } = require("@aws-sdk/s3-request-presigner");
 
-const bucket = process.env.S3_BUCKET;
-const region = process.env.AWS_REGION;
+const AWS_REGION = String(process.env.AWS_REGION || "").trim();
+const S3_BUCKET = String(process.env.S3_BUCKET || "").trim();
 
-if (!bucket || !region) {
-  console.warn("[storage] Missing S3_BUCKET or AWS_REGION");
-}
+if (!AWS_REGION) console.warn("⚠️ AWS_REGION missing");
+if (!S3_BUCKET) console.warn("⚠️ S3_BUCKET missing");
 
-const s3 = new S3Client({
-  region,
-  credentials: {
-    accessKeyId: process.env.AWS_ACCESS_KEY_ID,
-    secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
-  },
-});
+const s3 = new S3Client({ region: AWS_REGION });
 
-// ---------- helpers ----------
-async function streamToString(stream) {
-  return await new Promise((resolve, reject) => {
-    const chunks = [];
-    stream.on("data", (chunk) => chunks.push(Buffer.from(chunk)));
-    stream.on("error", reject);
-    stream.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
-  });
-}
-
-// ---------- JSON write ----------
-async function putJson(key, obj) {
-  if (!bucket) throw new Error("S3_BUCKET missing");
-
+async function putObjectToS3({ key, body, contentType }) {
+  if (!S3_BUCKET) throw new Error("S3_BUCKET missing");
   await s3.send(
     new PutObjectCommand({
-      Bucket: bucket,
-      Key: String(key).replace(/^\/+/, ""),
-      Body: JSON.stringify(obj ?? {}, null, 2),
-      ContentType: "application/json",
-      CacheControl: "no-store",
+      Bucket: S3_BUCKET,
+      Key: key,
+      Body: body,
+      ContentType: contentType || "application/octet-stream",
     })
   );
-
   return { ok: true, key };
 }
 
-// ---------- JSON read ----------
+async function presignGetUrl(key, expiresSeconds = 1200) {
+  if (!S3_BUCKET) throw new Error("S3_BUCKET missing");
+  const cmd = new GetObjectCommand({ Bucket: S3_BUCKET, Key: key });
+  return await getSignedUrl(s3, cmd, { expiresIn: expiresSeconds });
+}
+
+async function putJson(key, obj) {
+  const body = Buffer.from(JSON.stringify(obj ?? {}, null, 2), "utf8");
+  return await putObjectToS3({ key, body, contentType: "application/json" });
+}
+
 async function getJson(key) {
-  if (!bucket) throw new Error("S3_BUCKET missing");
-
+  if (!S3_BUCKET) throw new Error("S3_BUCKET missing");
+  const url = await presignGetUrl(key, 60); // short-lived fetch
+  const res = await fetch(url);
+  if (!res.ok) return null;
   try {
-    const out = await s3.send(
-      new GetObjectCommand({
-        Bucket: bucket,
-        Key: String(key).replace(/^\/+/, ""),
-      })
-    );
-
-    const text = await streamToString(out.Body);
-    return JSON.parse(text);
-  } catch (err) {
-    if (err?.$metadata?.httpStatusCode === 404) return null;
-    throw err;
+    return await res.json();
+  } catch {
+    return null;
   }
 }
 
-// ---------- presign GET ----------
-async function presignGetUrl(s3Key, expiresInSeconds = 1200) {
-  if (!bucket) throw new Error("S3_BUCKET missing");
-
-  return await getSignedUrl(
-    s3,
-    new GetObjectCommand({
-      Bucket: bucket,
-      Key: String(s3Key).replace(/^\/+/, ""),
-    }),
-    { expiresIn: expiresInSeconds }
-  );
-}
-
-module.exports = {
-  putJson,
-  getJson,
-  presignGetUrl,
-};
+module.exports = { putJson, getJson, presignGetUrl, putObjectToS3 };
