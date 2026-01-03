@@ -17,16 +17,14 @@ app.use(
   cors({
     origin: "*",
     methods: ["GET", "POST", "OPTIONS"],
-    allowedHeaders: ["Content-Type"],
+    allowedHeaders: ["Content-Type", "X-Project-Id", "X-ProjectId", "X-SB-Project-Id"],
   })
 );
 
 app.use(express.json({ limit: "50mb" }));
 
 // ---------- HEALTH ----------
-app.get("/api/health", (_req, res) => {
-  res.json({ ok: true });
-});
+app.get("/api/health", (_req, res) => res.json({ ok: true }));
 
 // ---------- PUBLISH PROOF ----------
 app.get("/api/publish-proof", (_req, res) => {
@@ -34,18 +32,55 @@ app.get("/api/publish-proof", (_req, res) => {
 });
 
 // =======================================================
+// helper: best-effort projectId resolution (NO FRONTEND CHANGES)
+// supports:
+// - body: projectId
+// - query: projectId
+// - headers: x-project-id / x-projectid / x-sb-project-id
+// - referer: http://localhost:5173/minisite/<projectId>/...
+// =======================================================
+function resolveProjectId(req) {
+  const bodyId = String(req.body?.projectId || "").trim();
+  if (bodyId) return bodyId;
+
+  const queryId = String(req.query?.projectId || "").trim();
+  if (queryId) return queryId;
+
+  const h1 = String(req.headers["x-project-id"] || "").trim();
+  if (h1) return h1;
+
+  const h2 = String(req.headers["x-projectid"] || "").trim();
+  if (h2) return h2;
+
+  const h3 = String(req.headers["x-sb-project-id"] || "").trim();
+  if (h3) return h3;
+
+  const ref = String(req.headers["referer"] || req.headers["referrer"] || "").trim();
+  if (ref) {
+    // matches: /minisite/304439/catalog  OR /minisite/304439/anything
+    const m = ref.match(/\/minisite\/(\d{3,})\b/);
+    if (m && m[1]) return String(m[1]);
+  }
+
+  return "";
+}
+
+// =======================================================
 // POST /api/upload-to-s3
-// multipart/form-data with field "file"
-// expects projectId either as:
-//  - form field: projectId
-//  - or query: ?projectId=...
-// writes into: storage/projects/<projectId>/catalog/uploads/<ts>_<rand>_<name>
+// multipart/form-data field "file"
+// writes to: storage/projects/<projectId>/catalog/uploads/<ts>_<rand>_<name>
 // returns: { ok:true, s3Key }
 // =======================================================
 app.post("/api/upload-to-s3", upload.single("file"), async (req, res) => {
   try {
-    const projectId = String(req.body?.projectId || req.query?.projectId || "").trim();
-    if (!projectId) return res.status(400).json({ ok: false, error: "MISSING_PROJECT_ID" });
+    const projectId = resolveProjectId(req);
+    if (!projectId) {
+      return res.status(400).json({
+        ok: false,
+        error: "MISSING_PROJECT_ID",
+        hint: "Expected projectId in body/query/header, or referer /minisite/<projectId>/...",
+      });
+    }
 
     if (!req.file) return res.status(400).json({ ok: false, error: "NO_FILE" });
 
@@ -59,7 +94,7 @@ app.post("/api/upload-to-s3", upload.single("file"), async (req, res) => {
       contentType: req.file.mimetype || "application/octet-stream",
     });
 
-    res.json({ ok: true, s3Key: key });
+    res.json({ ok: true, projectId, s3Key: key });
   } catch (err) {
     console.error("upload-to-s3 error:", err);
     res.status(500).json({ ok: false, error: err?.message || String(err) });
@@ -68,14 +103,14 @@ app.post("/api/upload-to-s3", upload.single("file"), async (req, res) => {
 
 // =======================================================
 // GET /api/playback-url?s3Key=...
-// returns a short-lived signed URL to play an S3 object
+// returns short-lived signed URL
 // =======================================================
 app.get("/api/playback-url", async (req, res) => {
   try {
     const s3Key = String(req.query?.s3Key || "").trim();
     if (!s3Key) return res.status(400).json({ ok: false, error: "MISSING_S3KEY" });
 
-    const url = await presignGetUrl(s3Key, 60 * 20); // 20 minutes
+    const url = await presignGetUrl(s3Key, 60 * 20);
     res.json({ ok: true, s3Key, url });
   } catch (err) {
     console.error("playback-url error:", err);
@@ -84,14 +119,12 @@ app.get("/api/playback-url", async (req, res) => {
 });
 
 // =======================================================
-// MASTER SAVE (writes snapshot + latest pointer)
+// MASTER SAVE
 // =======================================================
 app.post("/api/master-save", async (req, res) => {
   try {
     const { projectId, project } = req.body || {};
-    if (!projectId || !project) {
-      return res.status(400).json({ ok: false, error: "MISSING_PROJECT" });
-    }
+    if (!projectId || !project) return res.status(400).json({ ok: false, error: "MISSING_PROJECT" });
 
     const now = new Date().toISOString();
     const ts = now.replace(/[:.]/g, "-");
@@ -99,18 +132,8 @@ app.post("/api/master-save", async (req, res) => {
     const snapshotKey = `storage/projects/${projectId}/producer_returns/snapshots/${ts}.json`;
     const latestKey = `storage/projects/${projectId}/producer_returns/latest.json`;
 
-    await putJson(snapshotKey, {
-      projectId,
-      createdAt: now,
-      source: "minisite-master-save",
-      data: project,
-    });
-
-    await putJson(latestKey, {
-      projectId,
-      latestSnapshotKey: snapshotKey,
-      lastMasterSaveAt: now,
-    });
+    await putJson(snapshotKey, { projectId, createdAt: now, source: "minisite-master-save", data: project });
+    await putJson(latestKey, { projectId, latestSnapshotKey: snapshotKey, lastMasterSaveAt: now });
 
     res.json({ ok: true, snapshotKey, latestKey });
   } catch (err) {
@@ -120,8 +143,7 @@ app.post("/api/master-save", async (req, res) => {
 });
 
 // =======================================================
-// MASTER SAVE LATEST (reads latest pointer + snapshot)
-// GET /api/master-save/latest/:projectId
+// MASTER SAVE LATEST
 // =======================================================
 app.get("/api/master-save/latest/:projectId", async (req, res) => {
   try {
@@ -133,14 +155,10 @@ app.get("/api/master-save/latest/:projectId", async (req, res) => {
       String(latest?.latestSnapshotKey || "").trim() ||
       String(latest?.snapshotKey || "").trim();
 
-    if (!snapKey) {
-      return res.status(404).json({ ok: false, error: "NO_LATEST_SNAPSHOT_KEY", latestKey });
-    }
+    if (!snapKey) return res.status(404).json({ ok: false, error: "NO_LATEST_SNAPSHOT_KEY", latestKey });
 
     const snapshot = await getJson(snapKey);
-    if (!snapshot) {
-      return res.status(404).json({ ok: false, error: "SNAPSHOT_NOT_FOUND", snapKey });
-    }
+    if (!snapshot) return res.status(404).json({ ok: false, error: "SNAPSHOT_NOT_FOUND", snapKey });
 
     res.json({ ok: true, latestKey, latest, snapshot });
   } catch (err) {
@@ -150,7 +168,7 @@ app.get("/api/master-save/latest/:projectId", async (req, res) => {
 });
 
 // =======================================================
-// 🔒 ALBUM-ONLY EXTRACTOR (keeps album order)
+// 🔒 ALBUM-ONLY EXTRACTOR
 // =======================================================
 function extractAlbumTracks(project) {
   const albumSongs = Array.isArray(project?.album?.songs) ? project.album.songs : [];
@@ -183,16 +201,11 @@ function extractAlbumTracks(project) {
 app.post("/api/publish-minisite", async (req, res) => {
   try {
     const { projectId, snapshotKey } = req.body || {};
-    if (!projectId || !snapshotKey) {
-      return res.status(400).json({ ok: false, error: "MISSING_INPUT" });
-    }
+    if (!projectId || !snapshotKey) return res.status(400).json({ ok: false, error: "MISSING_INPUT" });
 
     const snap = await getJson(snapshotKey);
     const project = snap?.data;
-
-    if (!project) {
-      return res.status(400).json({ ok: false, error: "INVALID_SNAPSHOT" });
-    }
+    if (!project) return res.status(400).json({ ok: false, error: "INVALID_SNAPSHOT" });
 
     const rawTracks = extractAlbumTracks(project);
     if (!rawTracks.length) {
@@ -247,17 +260,11 @@ app.get("/api/publish/:shareId/manifest", async (req, res) => {
     const key = `public/players/${shareId}/manifest.json`;
     const manifest = await getJson(key);
 
-    if (!manifest) {
-      return res.status(404).json({ ok: false, error: "MANIFEST_NOT_FOUND" });
-    }
-
+    if (!manifest) return res.status(404).json({ ok: false, error: "MANIFEST_NOT_FOUND" });
     res.json(manifest);
   } catch (err) {
     res.status(500).json({ ok: false, error: err?.message || String(err) });
   }
 });
 
-// ---------- START ----------
-app.listen(port, () => {
-  console.log(`album-backend running on ${port}`);
-});
+app.listen(port, () => console.log(`album-backend running on ${port}`));
