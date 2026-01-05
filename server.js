@@ -13,8 +13,15 @@ const AWS_REGION = process.env.AWS_REGION || "us-west-1";
 const S3_BUCKET = process.env.S3_BUCKET || process.env.AWS_S3_BUCKET || "";
 const SIGNED_URL_EXPIRES_SECONDS = Number(process.env.SIGNED_URL_EXPIRES_SECONDS || 1200);
 
-// Published artifacts location in S3
-const PUBLISHED_PREFIX = (process.env.PUBLISHED_PREFIX || "storage/published").replace(/^\/+|\/+$/g, "");
+// ✅ Your publish writes: public/players/<shareId>/manifest.json
+// Keep env override, but default to the correct location.
+const PLAYERS_PREFIX = (process.env.PLAYERS_PREFIX || "public/players").replace(/^\/+|\/+$/g, "");
+
+// Optional legacy fallback (older assumption); only used if players path missing.
+const LEGACY_PUBLISHED_PREFIX = (process.env.LEGACY_PUBLISHED_PREFIX || "storage/published").replace(
+  /^\/+|\/+$/g,
+  ""
+);
 
 const ALLOWED_ORIGINS = [
   "https://blackout-web.onrender.com",
@@ -25,8 +32,10 @@ const ALLOWED_ORIGINS = [
 app.use(
   cors({
     origin: (origin, cb) => {
+      // allow non-browser / curl
       if (!origin) return cb(null, true);
       if (ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
+      // If you want to lock down later, change this to cb(new Error("Not allowed"), false)
       return cb(null, true);
     },
     methods: ["GET", "POST", "OPTIONS"],
@@ -56,6 +65,21 @@ async function s3GetJson({ Bucket, Key }) {
   return JSON.parse(raw);
 }
 
+async function readManifest({ bucket, shareId }) {
+  // Primary (correct) path
+  const primaryKey = `${PLAYERS_PREFIX}/${shareId}/manifest.json`;
+
+  try {
+    const m = await s3GetJson({ Bucket: bucket, Key: primaryKey });
+    return { manifest: m, keyUsed: primaryKey };
+  } catch {
+    // Legacy fallback path (only if needed)
+    const legacyKey = `${LEGACY_PUBLISHED_PREFIX}/${shareId}/manifest.json`;
+    const m = await s3GetJson({ Bucket: bucket, Key: legacyKey });
+    return { manifest: m, keyUsed: legacyKey };
+  }
+}
+
 // ---------- ROUTES ----------
 app.get("/api/health", (req, res) => {
   res.json({ ok: true, service: "album-backend", version: 1 });
@@ -63,7 +87,7 @@ app.get("/api/health", (req, res) => {
 
 /**
  * Published manifest
- * Reads from S3: {PUBLISHED_PREFIX}/{shareId}/manifest.json
+ * Reads from S3: public/players/<shareId>/manifest.json  (default)
  * Returns tracks with s3Key only (no pre-signed urls)
  */
 app.get("/api/publish/:shareId/manifest", async (req, res) => {
@@ -73,25 +97,35 @@ app.get("/api/publish/:shareId/manifest", async (req, res) => {
 
     const bucket = must(S3_BUCKET, "Missing env S3_BUCKET (or AWS_S3_BUCKET)");
 
-    const key = `${PUBLISHED_PREFIX}/${shareId}/manifest.json`;
-
-    let m;
+    let m, keyUsed;
     try {
-      m = await s3GetJson({ Bucket: bucket, Key: key });
+      const out = await readManifest({ bucket, shareId });
+      m = out.manifest;
+      keyUsed = out.keyUsed;
     } catch (e) {
       // return 404 if missing
-      return res.status(404).json({ ok: false, error: `manifest not found at s3://${bucket}/${key}` });
+      return res.status(404).json({
+        ok: false,
+        error: `manifest not found at s3://${bucket}/${PLAYERS_PREFIX}/${shareId}/manifest.json`,
+      });
     }
 
+    // Your publish result includes: { ok:true, shareId, projectId, publishedAt, tracks:[{slot,title,s3Key,url}] }
     if (!m?.ok || !Array.isArray(m.tracks)) {
       return res.status(404).json({ ok: false, error: "manifest invalid" });
     }
 
-    const tracks = m.tracks.map((t) => ({
-      slot: Number(t.slot || 0),
-      title: String(t.title || "").trim(),
-      s3Key: String(t.s3Key || "").trim(),
-    }));
+    const tracks = m.tracks
+      .map((t) => ({
+        slot: Number(t?.slot || 0),
+        title: String(t?.title || "").trim(),
+        s3Key: String(t?.s3Key || "").trim(),
+      }))
+      .filter((t) => t.s3Key);
+
+    if (!tracks.length) {
+      return res.status(404).json({ ok: false, error: "manifest has no tracks with s3Key" });
+    }
 
     return res.json({
       ok: true,
@@ -100,6 +134,7 @@ app.get("/api/publish/:shareId/manifest", async (req, res) => {
       shareId: String(m.shareId || shareId),
       projectId: String(m.projectId || ""),
       publishedAt: String(m.publishedAt || ""),
+      manifestKey: keyUsed, // useful for debugging
       trackCount: tracks.length,
       tracks,
     });
@@ -132,5 +167,7 @@ app.listen(PORT, () => {
   console.log(`album-backend listening on ${PORT}`);
   console.log(`AWS_REGION=${AWS_REGION}`);
   console.log(`S3_BUCKET=${S3_BUCKET || "(missing)"}`);
-  console.log(`PUBLISHED_PREFIX=${PUBLISHED_PREFIX}`);
+  console.log(`PLAYERS_PREFIX=${PLAYERS_PREFIX}`);
+  console.log(`LEGACY_PUBLISHED_PREFIX=${LEGACY_PUBLISHED_PREFIX}`);
+  console.log(`SIGNED_URL_EXPIRES_SECONDS=${SIGNED_URL_EXPIRES_SECONDS}`);
 });
