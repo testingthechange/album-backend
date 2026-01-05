@@ -3,9 +3,6 @@ import express from "express";
 import cors from "cors";
 import { S3Client, GetObjectCommand } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
-import fs from "fs";
-import path from "path";
-import { fileURLToPath } from "url";
 
 const app = express();
 app.use(express.json());
@@ -14,10 +11,11 @@ app.use(express.json());
 const PORT = process.env.PORT || 10000;
 const AWS_REGION = process.env.AWS_REGION || "us-west-1";
 const S3_BUCKET = process.env.S3_BUCKET || process.env.AWS_S3_BUCKET || "";
-const PUBLISH_STORE_DIR = process.env.PUBLISH_STORE_DIR || "./publish_store"; // local json store
 const SIGNED_URL_EXPIRES_SECONDS = Number(process.env.SIGNED_URL_EXPIRES_SECONDS || 1200);
 
-// Allow your deployed site + local dev
+// Published artifacts location in S3
+const PUBLISHED_PREFIX = (process.env.PUBLISHED_PREFIX || "storage/published").replace(/^\/+|\/+$/g, "");
+
 const ALLOWED_ORIGINS = [
   "https://blackout-web.onrender.com",
   "http://localhost:5173",
@@ -27,10 +25,9 @@ const ALLOWED_ORIGINS = [
 app.use(
   cors({
     origin: (origin, cb) => {
-      // allow curl/no-origin
       if (!origin) return cb(null, true);
       if (ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
-      return cb(null, true); // loosened to avoid blocking while you iterate
+      return cb(null, true);
     },
     methods: ["GET", "POST", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization"],
@@ -45,24 +42,18 @@ function must(v, msg) {
   return v;
 }
 
-function safeJsonParse(s) {
-  try {
-    return JSON.parse(s);
-  } catch {
-    return null;
-  }
-}
+async function s3GetJson({ Bucket, Key }) {
+  const cmd = new GetObjectCommand({ Bucket, Key });
+  const out = await s3.send(cmd);
 
-function ensureDir(p) {
-  if (!fs.existsSync(p)) fs.mkdirSync(p, { recursive: true });
-}
+  const body = out?.Body;
+  if (!body) throw new Error(`S3 missing body for ${Key}`);
 
-function readPublishManifest(shareId) {
-  // You can swap this to PG later; keeping local file store for now.
-  const p = path.join(PUBLISH_STORE_DIR, `${shareId}.manifest.json`);
-  if (!fs.existsSync(p)) return null;
-  const raw = fs.readFileSync(p, "utf8");
-  return safeJsonParse(raw);
+  const chunks = [];
+  for await (const chunk of body) chunks.push(chunk);
+  const raw = Buffer.concat(chunks).toString("utf8");
+
+  return JSON.parse(raw);
 }
 
 // ---------- ROUTES ----------
@@ -71,21 +62,31 @@ app.get("/api/health", (req, res) => {
 });
 
 /**
- * A) PUBLISHED MANIFEST (STABLE)
- * Returns: { ok, shareId, projectId, publishedAt, tracks: [{slot,title,s3Key}] }
- * IMPORTANT: NO pre-signed URLs returned here.
+ * Published manifest
+ * Reads from S3: {PUBLISHED_PREFIX}/{shareId}/manifest.json
+ * Returns tracks with s3Key only (no pre-signed urls)
  */
-app.get("/api/publish/:shareId/manifest", (req, res) => {
+app.get("/api/publish/:shareId/manifest", async (req, res) => {
   try {
     const { shareId } = req.params;
     if (!shareId) return res.status(400).json({ ok: false, error: "missing shareId" });
 
-    const m = readPublishManifest(shareId);
-    if (!m?.ok || !Array.isArray(m.tracks)) {
-      return res.status(404).json({ ok: false, error: "manifest not found" });
+    const bucket = must(S3_BUCKET, "Missing env S3_BUCKET (or AWS_S3_BUCKET)");
+
+    const key = `${PUBLISHED_PREFIX}/${shareId}/manifest.json`;
+
+    let m;
+    try {
+      m = await s3GetJson({ Bucket: bucket, Key: key });
+    } catch (e) {
+      // return 404 if missing
+      return res.status(404).json({ ok: false, error: `manifest not found at s3://${bucket}/${key}` });
     }
 
-    // Strip any accidental url fields (defensive)
+    if (!m?.ok || !Array.isArray(m.tracks)) {
+      return res.status(404).json({ ok: false, error: "manifest invalid" });
+    }
+
     const tracks = m.tracks.map((t) => ({
       slot: Number(t.slot || 0),
       title: String(t.title || "").trim(),
@@ -108,9 +109,8 @@ app.get("/api/publish/:shareId/manifest", (req, res) => {
 });
 
 /**
- * A) SIGN ON DEMAND (PER TRACK)
+ * Sign on demand
  * GET /api/playback-url?s3Key=storage/projects/...mp3
- * Returns: { ok, url, expiresSeconds }
  */
 app.get("/api/playback-url", async (req, res) => {
   try {
@@ -128,11 +128,9 @@ app.get("/api/playback-url", async (req, res) => {
   }
 });
 
-// ---------- START ----------
-ensureDir(PUBLISH_STORE_DIR);
-
 app.listen(PORT, () => {
   console.log(`album-backend listening on ${PORT}`);
+  console.log(`AWS_REGION=${AWS_REGION}`);
   console.log(`S3_BUCKET=${S3_BUCKET || "(missing)"}`);
-  console.log(`PUBLISH_STORE_DIR=${PUBLISH_STORE_DIR}`);
+  console.log(`PUBLISHED_PREFIX=${PUBLISHED_PREFIX}`);
 });
