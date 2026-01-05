@@ -1,27 +1,14 @@
 // server.js
-// album-backend
-//
-// Fix: NEVER return stale presigned URLs from publish time.
-// Instead, store s3Key in the published manifest, and re-sign fresh URLs
-// every time the client requests /api/publish/:shareId/manifest.
+import express from "express";
+import cors from "cors";
 
-const express = require("express");
-const cors = require("cors");
-
-const { S3Client, GetObjectCommand } = require("@aws-sdk/client-s3");
-const { getSignedUrl } = require("@aws-sdk/s3-request-presigner");
+import { S3Client, GetObjectCommand } from "@aws-sdk/client-s3";
+import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 
 const app = express();
 app.use(express.json());
 
-// -------------------- ENV --------------------
-const PORT = process.env.PORT || 10000;
-
-// Bucket/region for where published artifacts + audio live
-const AWS_REGION = process.env.AWS_REGION || "us-west-1";
-const S3_BUCKET = process.env.S3_BUCKET || process.env.AWS_S3_BUCKET || ""; // set this on Render
-
-// Optional: lock down later (for now permissive is fine while debugging)
+// CORS (keep permissive while you’re iterating; tighten later)
 app.use(
   cors({
     origin: true,
@@ -29,120 +16,123 @@ app.use(
   })
 );
 
-// -------------------- S3 --------------------
-const s3 = new S3Client({ region: AWS_REGION });
+const PORT = process.env.PORT || 3001;
 
-async function streamToString(stream) {
-  // AWS SDK v3 GetObjectCommand returns a readable stream in Node
-  const chunks = [];
-  for await (const chunk of stream) chunks.push(chunk);
-  return Buffer.concat(chunks).toString("utf-8");
-}
+// ---------- ENV ----------
+const AWS_REGION = (process.env.AWS_REGION || process.env.AWS_DEFAULT_REGION || "us-west-1").trim();
+const S3_BUCKET = (process.env.S3_BUCKET || "").trim();
 
-async function readJsonFromS3(key) {
-  const out = await s3.send(
-    new GetObjectCommand({
-      Bucket: S3_BUCKET,
-      Key: key,
-    })
-  );
-  const body = await streamToString(out.Body);
-  return JSON.parse(body);
-}
-
-async function signGetUrl(key, expiresSeconds = 900) {
-  // keep short (10–15 min) because we can always re-sign on next manifest fetch
-  return await getSignedUrl(
-    s3,
-    new GetObjectCommand({
-      Bucket: S3_BUCKET,
-      Key: key,
-    }),
-    { expiresIn: expiresSeconds }
-  );
-}
-
-function safeStr(v) {
-  return String(v || "").trim();
-}
-
-// Your publisher already writes this shape (you showed it):
+// Where publish writes the manifest (based on your publish output):
 // manifestKey: "public/players/<shareId>/manifest.json"
 function manifestKeyForShareId(shareId) {
   return `public/players/${shareId}/manifest.json`;
 }
 
-// -------------------- ROUTES --------------------
+// ---------- S3 ----------
+const s3 = new S3Client({ region: AWS_REGION });
+
+async function readJsonFromS3({ bucket, key }) {
+  const cmd = new GetObjectCommand({ Bucket: bucket, Key: key });
+  const resp = await s3.send(cmd);
+
+  if (!resp?.Body) throw new Error("S3 GetObject missing body");
+
+  const text = await streamToString(resp.Body);
+  return JSON.parse(text);
+}
+
+function streamToString(body) {
+  // AWS SDK v3 Body is a stream in Node
+  return new Promise((resolve, reject) => {
+    let data = "";
+    body.setEncoding("utf8");
+    body.on("data", (chunk) => (data += chunk));
+    body.on("end", () => resolve(data));
+    body.on("error", reject);
+  });
+}
+
+async function signGetObjectUrl({ bucket, key, expiresInSeconds = 3600 }) {
+  const cmd = new GetObjectCommand({ Bucket: bucket, Key: key });
+  return await getSignedUrl(s3, cmd, { expiresIn: expiresInSeconds });
+}
+
+// ---------- ROUTES ----------
 app.get("/api/health", (req, res) => {
-  res.json({ ok: true });
+  res.json({
+    ok: true,
+    service: "album-backend",
+    region: AWS_REGION,
+    hasBucket: !!S3_BUCKET,
+    time: new Date().toISOString(),
+  });
 });
 
 /**
- * IMPORTANT FIX:
- * This endpoint must return FRESH signed URLs.
+ * Manifest endpoint used by blackout-web:
+ * GET /api/publish/:shareId/manifest
  *
- * blackout-web calls:
- *   GET ${BACKEND_BASE}/api/publish/:shareId/manifest
- *
- * If your stored manifest already contains "tracks[].s3Key", we re-sign here.
- * If your stored manifest contains old "tracks[].url", we IGNORE it and regenerate.
+ * KEY FIX:
+ * - Always loads the stored manifest JSON from S3
+ * - Ignores any stale `url` fields in it
+ * - Re-signs fresh urls from each track's `s3Key` on every request
  */
 app.get("/api/publish/:shareId/manifest", async (req, res) => {
   try {
-    const shareId = safeStr(req.params.shareId);
-    if (!shareId) return res.status(400).json({ ok: false, error: "missing shareId" });
-    if (!S3_BUCKET) return res.status(500).json({ ok: false, error: "missing S3_BUCKET env" });
+    const shareId = String(req.params.shareId || "").trim();
+    if (!shareId) return res.status(400).json({ ok: false, error: "Missing shareId" });
 
-    const key = manifestKeyForShareId(shareId);
-    const stored = await readJsonFromS3(key);
-
-    const storedTracks = Array.isArray(stored?.tracks) ? stored.tracks : [];
-    if (!storedTracks.length) {
-      return res.status(404).json({ ok: false, error: "manifest has no tracks" });
+    if (!S3_BUCKET) {
+      return res.status(500).json({ ok: false, error: "Missing env S3_BUCKET" });
     }
 
-    const tracks = await Promise.all(
-      storedTracks.map(async (t) => {
-        const s3Key = safeStr(t?.s3Key);
-        const title = safeStr(t?.title) || "Untitled";
+    const key = manifestKeyForShareId(shareId);
 
+    const manifest = await readJsonFromS3({ bucket: S3_BUCKET, key });
+
+    // manifest you showed is like:
+    // { ok:true, version:1, mode:"album", shareId, projectId, publishedAt, trackCount, tracks:[{slot,title,s3Key,url}] }
+    const tracks = Array.isArray(manifest?.tracks) ? manifest.tracks : [];
+
+    // Re-sign from s3Key each time.
+    const signedTracks = await Promise.all(
+      tracks.map(async (t) => {
+        const s3Key = String(t?.s3Key || "").trim();
         if (!s3Key) {
-          // keep shape stable even if bad data
-          return { ...t, title, s3Key: "", url: "" };
+          return {
+            ...t,
+            url: "",
+            _signError: "Missing s3Key",
+          };
         }
-
-        // 🔥 regenerate a fresh URL every request
-        const url = await signGetUrl(s3Key, 900);
-
+        const url = await signGetObjectUrl({ bucket: S3_BUCKET, key: s3Key, expiresInSeconds: 3600 });
         return {
           ...t,
-          title,
-          s3Key,
-          url,
+          url, // fresh
         };
       })
     );
 
-    // Return the shape blackout-web expects (you pasted earlier)
-    res.json({
+    const out = {
+      ...manifest,
       ok: true,
-      version: stored?.version ?? 1,
-      mode: stored?.mode ?? "album",
       shareId,
-      projectId: safeStr(stored?.projectId),
-      publishedAt: safeStr(stored?.publishedAt),
-      trackCount: tracks.length,
-      tracks,
-    });
-  } catch (err) {
-    console.error("GET /api/publish/:shareId/manifest failed:", err);
-    res.status(500).json({ ok: false, error: "manifest fetch failed" });
+      tracks: signedTracks,
+      trackCount: signedTracks.length,
+      signedAt: new Date().toISOString(),
+      expiresInSeconds: 3600,
+    };
+
+    // Prevent caching so the browser always gets fresh signed URLs
+    res.setHeader("Cache-Control", "no-store");
+    res.json(out);
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e?.message || e) });
   }
 });
 
-// -------------------- START --------------------
 app.listen(PORT, () => {
-  console.log(`album-backend listening on :${PORT}`);
-  console.log(`AWS_REGION=${AWS_REGION}`);
-  console.log(`S3_BUCKET=${S3_BUCKET || "(missing)"}`);
+  console.log(`[album-backend] listening on ${PORT}`);
+  console.log(`[album-backend] region=${AWS_REGION} bucket=${S3_BUCKET || "(missing)"}`);
 });
+
