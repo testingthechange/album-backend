@@ -1,270 +1,140 @@
-// server.js — album-backend (AWS S3) — album-only publish + playback-url + upload-to-s3
+// album-backend/server.js
+import express from "express";
+import cors from "cors";
 
-const express = require("express");
-const cors = require("cors");
-const crypto = require("crypto");
-const multer = require("multer");
+import { S3Client, GetObjectCommand } from "@aws-sdk/client-s3";
+import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 
-const upload = multer({ storage: multer.memoryStorage() });
-
-const { putJson, getJson, presignGetUrl, putObjectToS3 } = require("./storage");
+// If you already have a "readJson" helper, use that instead.
+// This version reads JSON from S3 using bucket + key.
+import { Readable } from "stream";
 
 const app = express();
-const port = process.env.PORT || 10000;
+app.use(express.json());
 
-// ---------- CORS ----------
+// ---- CORS (adjust as needed) ----
+// Allow your web app origin. You can also set "*" temporarily for debugging.
+const allowedOrigins = [
+  process.env.WEB_ORIGIN || "https://blackout-web.onrender.com",
+];
 app.use(
   cors({
-    origin: "*",
-    methods: ["GET", "POST", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "X-Project-Id", "X-ProjectId", "X-SB-Project-Id"],
+    origin: (origin, cb) => {
+      if (!origin) return cb(null, true);
+      if (allowedOrigins.includes(origin)) return cb(null, true);
+      return cb(null, true); // keep permissive for now; tighten later
+    },
+    credentials: true,
   })
 );
 
-app.use(express.json({ limit: "50mb" }));
+// ---- ENV ----
+const AWS_REGION = process.env.AWS_REGION || "us-west-1";
+const S3_BUCKET = process.env.S3_BUCKET; // REQUIRED (the bucket you publish into)
 
-// ---------- HEALTH ----------
-app.get("/api/health", (_req, res) => res.json({ ok: true }));
-
-// ---------- PUBLISH PROOF ----------
-app.get("/api/publish-proof", (_req, res) => {
-  res.json({ ok: true, proof: "publish-proof-v1-album-only" });
-});
-
-// =======================================================
-// helper: best-effort projectId resolution (NO FRONTEND CHANGES)
-// supports:
-// - body: projectId
-// - query: projectId
-// - headers: x-project-id / x-projectid / x-sb-project-id
-// - referer: http://localhost:5173/minisite/<projectId>/...
-// =======================================================
-function resolveProjectId(req) {
-  const bodyId = String(req.body?.projectId || "").trim();
-  if (bodyId) return bodyId;
-
-  const queryId = String(req.query?.projectId || "").trim();
-  if (queryId) return queryId;
-
-  const h1 = String(req.headers["x-project-id"] || "").trim();
-  if (h1) return h1;
-
-  const h2 = String(req.headers["x-projectid"] || "").trim();
-  if (h2) return h2;
-
-  const h3 = String(req.headers["x-sb-project-id"] || "").trim();
-  if (h3) return h3;
-
-  const ref = String(req.headers["referer"] || req.headers["referrer"] || "").trim();
-  if (ref) {
-    // matches: /minisite/304439/catalog  OR /minisite/304439/anything
-    const m = ref.match(/\/minisite\/(\d{3,})\b/);
-    if (m && m[1]) return String(m[1]);
-  }
-
-  return "";
+// IMPORTANT: your stored manifests are using keys like:
+// public/players/<shareId>/manifest.json
+// Make sure this matches what your publisher writes.
+function manifestKeyForShareId(shareId) {
+  return `public/players/${shareId}/manifest.json`;
 }
 
-// =======================================================
-// POST /api/upload-to-s3
-// multipart/form-data field "file"
-// writes to: storage/projects/<projectId>/catalog/uploads/<ts>_<rand>_<name>
-// returns: { ok:true, s3Key }
-// =======================================================
-app.post("/api/upload-to-s3", upload.single("file"), async (req, res) => {
-  try {
-    const projectId = resolveProjectId(req);
-    if (!projectId) {
-      return res.status(400).json({
-        ok: false,
-        error: "MISSING_PROJECT_ID",
-        hint: "Expected projectId in body/query/header, or referer /minisite/<projectId>/...",
-      });
-    }
+if (!S3_BUCKET) {
+  console.warn("WARNING: Missing env S3_BUCKET");
+}
 
-    if (!req.file) return res.status(400).json({ ok: false, error: "NO_FILE" });
+// ---- S3 ----
+const s3 = new S3Client({ region: AWS_REGION });
 
-    const safeName = String(req.file.originalname || "upload.bin").replace(/[^\w.\-]+/g, "_");
-    const rand = crypto.randomBytes(6).toString("hex");
-    const key = `storage/projects/${projectId}/catalog/uploads/${Date.now()}_${rand}_${safeName}`;
+async function streamToString(stream) {
+  const chunks = [];
+  for await (const chunk of stream) chunks.push(chunk);
+  return Buffer.concat(chunks).toString("utf-8");
+}
 
-    await putObjectToS3({
-      key,
-      body: req.file.buffer,
-      contentType: req.file.mimetype || "application/octet-stream",
-    });
-
-    res.json({ ok: true, projectId, s3Key: key });
-  } catch (err) {
-    console.error("upload-to-s3 error:", err);
-    res.status(500).json({ ok: false, error: err?.message || String(err) });
-  }
-});
-
-// =======================================================
-// GET /api/playback-url?s3Key=...
-// returns short-lived signed URL
-// =======================================================
-app.get("/api/playback-url", async (req, res) => {
-  try {
-    const s3Key = String(req.query?.s3Key || "").trim();
-    if (!s3Key) return res.status(400).json({ ok: false, error: "MISSING_S3KEY" });
-
-    const url = await presignGetUrl(s3Key, 60 * 20);
-    res.json({ ok: true, s3Key, url });
-  } catch (err) {
-    console.error("playback-url error:", err);
-    res.status(500).json({ ok: false, error: err?.message || String(err) });
-  }
-});
-
-// =======================================================
-// MASTER SAVE
-// =======================================================
-app.post("/api/master-save", async (req, res) => {
-  try {
-    const { projectId, project } = req.body || {};
-    if (!projectId || !project) return res.status(400).json({ ok: false, error: "MISSING_PROJECT" });
-
-    const now = new Date().toISOString();
-    const ts = now.replace(/[:.]/g, "-");
-
-    const snapshotKey = `storage/projects/${projectId}/producer_returns/snapshots/${ts}.json`;
-    const latestKey = `storage/projects/${projectId}/producer_returns/latest.json`;
-
-    await putJson(snapshotKey, { projectId, createdAt: now, source: "minisite-master-save", data: project });
-    await putJson(latestKey, { projectId, latestSnapshotKey: snapshotKey, lastMasterSaveAt: now });
-
-    res.json({ ok: true, snapshotKey, latestKey });
-  } catch (err) {
-    console.error("master-save error:", err);
-    res.status(500).json({ ok: false, error: err?.message || String(err) });
-  }
-});
-
-// =======================================================
-// MASTER SAVE LATEST
-// =======================================================
-app.get("/api/master-save/latest/:projectId", async (req, res) => {
-  try {
-    const { projectId } = req.params;
-    const latestKey = `storage/projects/${projectId}/producer_returns/latest.json`;
-
-    const latest = await getJson(latestKey);
-    const snapKey =
-      String(latest?.latestSnapshotKey || "").trim() ||
-      String(latest?.snapshotKey || "").trim();
-
-    if (!snapKey) return res.status(404).json({ ok: false, error: "NO_LATEST_SNAPSHOT_KEY", latestKey });
-
-    const snapshot = await getJson(snapKey);
-    if (!snapshot) return res.status(404).json({ ok: false, error: "SNAPSHOT_NOT_FOUND", snapKey });
-
-    res.json({ ok: true, latestKey, latest, snapshot });
-  } catch (err) {
-    console.error("master-save latest error:", err);
-    res.status(500).json({ ok: false, error: err?.message || String(err) });
-  }
-});
-
-// =======================================================
-// 🔒 ALBUM-ONLY EXTRACTOR
-// =======================================================
-function extractAlbumTracks(project) {
-  const albumSongs = Array.isArray(project?.album?.songs) ? project.album.songs : [];
-
-  const pickS3Key = (s) => {
-    if (s?.file?.s3Key) return String(s.file.s3Key).trim();
-    if (s?.s3Key) return String(s.s3Key).trim();
-    if (s?.audioS3Key) return String(s.audioS3Key).trim();
-    if (s?.audioKey) return String(s.audioKey).trim();
-    if (s?.file?.key) return String(s.file.key).trim();
-    if (s?.fileKey) return String(s.fileKey).trim();
-    if (s?.files?.album?.s3Key) return String(s.files.album.s3Key).trim();
-    return "";
-  };
-
-  return albumSongs
-    .map((s, idx) => {
-      const slot = Number(s?.slot ?? idx + 1);
-      const title = String(s?.title || `Track ${slot}`).trim();
-      const s3Key = pickS3Key(s);
-      if (!s3Key) return null;
-      return { slot, title, s3Key };
+async function readJsonFromS3(key) {
+  const res = await s3.send(
+    new GetObjectCommand({
+      Bucket: S3_BUCKET,
+      Key: key,
     })
-    .filter(Boolean);
+  );
+  const body = await streamToString(res.Body);
+  return JSON.parse(body);
 }
 
-// =======================================================
-// POST /api/publish-minisite (ALBUM MODE ONLY)
-// =======================================================
-app.post("/api/publish-minisite", async (req, res) => {
-  try {
-    const { projectId, snapshotKey } = req.body || {};
-    if (!projectId || !snapshotKey) return res.status(400).json({ ok: false, error: "MISSING_INPUT" });
+async function signGetUrl(key, expiresSeconds = 900) {
+  const url = await getSignedUrl(
+    s3,
+    new GetObjectCommand({
+      Bucket: S3_BUCKET,
+      Key: key,
+    }),
+    { expiresIn: expiresSeconds }
+  );
+  return url;
+}
 
-    const snap = await getJson(snapshotKey);
-    const project = snap?.data;
-    if (!project) return res.status(400).json({ ok: false, error: "INVALID_SNAPSHOT" });
-
-    const rawTracks = extractAlbumTracks(project);
-    if (!rawTracks.length) {
-      return res.status(400).json({
-        ok: false,
-        error: "NO_ALBUM_AUDIO_FOUND",
-        hint: "Expected album.songs[*] to include an s3Key (e.g. song.file.s3Key)",
-      });
-    }
-
-    const tracks = [];
-    for (const t of rawTracks) {
-      const url = await presignGetUrl(t.s3Key, 60 * 20);
-      tracks.push({ ...t, url });
-    }
-
-    const shareId = crypto.randomBytes(8).toString("hex");
-    const manifestKey = `public/players/${shareId}/manifest.json`;
-
-    const manifest = {
-      ok: true,
-      version: 1,
-      mode: "album",
-      shareId,
-      projectId,
-      publishedAt: new Date().toISOString(),
-      trackCount: tracks.length,
-      tracks,
-    };
-
-    await putJson(manifestKey, manifest);
-
-    res.json({
-      ok: true,
-      shareId,
-      manifestKey,
-      manifestUrl: `/api/publish/${shareId}/manifest`,
-      publicUrl: `https://blackout-web.onrender.com/shop/product/${shareId}`,
-    });
-  } catch (err) {
-    console.error("publish error", err);
-    res.status(500).json({ ok: false, error: err?.message || String(err) });
-  }
+// ---- Health ----
+app.get("/api/health", (req, res) => {
+  res.json({ ok: true });
 });
 
-// =======================================================
-// GET /api/publish/:shareId/manifest
-// =======================================================
+// ---- Publish manifest (FIXED: refresh signed URLs every request) ----
+// Your blackout-web fetches: `${BACKEND_BASE}/api/publish/${shareId}/manifest`
 app.get("/api/publish/:shareId/manifest", async (req, res) => {
   try {
-    const shareId = req.params.shareId;
-    const key = `public/players/${shareId}/manifest.json`;
-    const manifest = await getJson(key);
+    const shareId = String(req.params.shareId || "").trim();
+    if (!shareId) return res.status(400).json({ ok: false, error: "missing shareId" });
+    if (!S3_BUCKET) return res.status(500).json({ ok: false, error: "missing S3_BUCKET env" });
 
-    if (!manifest) return res.status(404).json({ ok: false, error: "MANIFEST_NOT_FOUND" });
-    res.json(manifest);
+    // Read the stored manifest written at publish time.
+    // It should include track entries with at least: { title, s3Key }
+    const stored = await readJsonFromS3(manifestKeyForShareId(shareId));
+
+    const tracks = Array.isArray(stored?.tracks) ? stored.tracks : [];
+    if (!tracks.length) {
+      return res.status(404).json({ ok: false, error: "manifest has no tracks" });
+    }
+
+    // Re-sign URLs from s3Key each time so they never expire for the user.
+    const signedTracks = await Promise.all(
+      tracks.map(async (t) => {
+        const s3Key = String(t?.s3Key || "").trim();
+        const title = String(t?.title || "").trim() || "Untitled";
+
+        if (!s3Key) {
+          return { ...t, title, s3Key: "", url: "" };
+        }
+
+        const url = await signGetUrl(s3Key, 900); // 15 min is fine; it refreshes on reload
+        return {
+          ...t,
+          title,
+          s3Key,
+          url, // fresh presigned url
+        };
+      })
+    );
+
+    // Return a manifest shaped like blackout-web expects:
+    // { ok:true, shareId, projectId, publishedAt, tracks:[{title,url,s3Key,slot...}] }
+    return res.json({
+      ok: true,
+      version: stored?.version ?? 1,
+      mode: stored?.mode ?? "album",
+      shareId,
+      projectId: stored?.projectId || "",
+      publishedAt: stored?.publishedAt || "",
+      trackCount: signedTracks.length,
+      tracks: signedTracks,
+    });
   } catch (err) {
-    res.status(500).json({ ok: false, error: err?.message || String(err) });
+    console.error("manifest error", err);
+    return res.status(500).json({ ok: false, error: "manifest fetch failed" });
   }
 });
 
-app.listen(port, () => console.log(`album-backend running on ${port}`));
+// ---- Start ----
+const PORT = process.env.PORT || 10000;
+app.listen(PORT, () => console.log(`album-backend listening on ${PORT}`));
