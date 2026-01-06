@@ -1,4 +1,22 @@
 // server.js
+// ------------------------------------------------------------
+// IMPORTANT NOTE (2026-01-06):
+//
+// Uploads broke previously because the frontend called
+//   POST /api/upload-to-s3
+// while the backend only exposed
+//   POST /upload-to-s3
+//
+// Result: silent 404s.
+//
+// FIX: This server MUST support BOTH routes permanently.
+// Do NOT remove either route, even if one appears unused.
+//
+// If uploads ever break again, run:
+//   curl https://<backend>/api/health
+//   curl -X POST https://<backend>/api/upload-to-s3?projectId=TEST
+// ------------------------------------------------------------
+
 import express from "express";
 import cors from "cors";
 import multer from "multer";
@@ -20,12 +38,7 @@ const SIGNED_URL_EXPIRES_SECONDS = Number(
   process.env.SIGNED_URL_EXPIRES_SECONDS || 1200
 );
 
-const ALLOWED_ORIGINS = [
-  "https://blackout-web.onrender.com",
-  "http://localhost:5173",
-  "http://127.0.0.1:5173",
-].filter(Boolean);
-
+// ---------- CORS ----------
 app.use(
   cors({
     origin: (origin, cb) => cb(null, true),
@@ -34,10 +47,12 @@ app.use(
   })
 );
 
-// ---------- S3 ----------
+// ---------- AWS ----------
 const s3 = new S3Client({ region: AWS_REGION });
 
-// ---------- UPLOAD (multer in-memory) ----------
+// ---------- MULTER (IN-MEMORY UPLOADS) ----------
+// Files are uploaded directly to S3.
+// No disk storage, no temp persistence.
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 30 * 1024 * 1024 }, // 30MB
@@ -49,12 +64,21 @@ function must(v, msg) {
   return v;
 }
 
-// ---------- HEALTH ----------
+// ---------- HEALTH CHECK ----------
+// Use this to instantly verify which backend is live.
 app.get("/api/health", (req, res) => {
-  res.json({ ok: true, service: "album-backend", version: 1 });
+  res.json({
+    ok: true,
+    service: "album-backend",
+    uploadRoutes: ["/upload-to-s3", "/api/upload-to-s3"],
+    note: "Do not remove either upload route",
+  });
 });
 
-// ---------- UPLOAD HANDLER (SHARED) ----------
+// ---------- SHARED UPLOAD HANDLER ----------
+// Expects multipart/form-data:
+//   - file  (binary)
+//   - s3Key (string)
 async function uploadToS3Handler(req, res) {
   try {
     const projectId = String(req.query.projectId || "").trim();
@@ -93,13 +117,15 @@ async function uploadToS3Handler(req, res) {
     });
   } catch (e) {
     console.error("upload-to-s3 error:", e);
-    return res
-      .status(500)
-      .json({ ok: false, error: String(e?.message || e) });
+    return res.status(500).json({
+      ok: false,
+      error: String(e?.message || e),
+    });
   }
 }
 
-// ---------- MOUNT BOTH ROUTES (CRITICAL FIX) ----------
+// ---------- CRITICAL ROUTES (DO NOT REMOVE) ----------
+// Both routes must exist to prevent frontend/backend drift.
 app.post("/upload-to-s3", upload.single("file"), uploadToS3Handler);
 app.post("/api/upload-to-s3", upload.single("file"), uploadToS3Handler);
 
@@ -124,9 +150,10 @@ app.get("/api/playback-url", async (req, res) => {
       expiresSeconds: SIGNED_URL_EXPIRES_SECONDS,
     });
   } catch (e) {
-    return res
-      .status(500)
-      .json({ ok: false, error: String(e?.message || e) });
+    return res.status(500).json({
+      ok: false,
+      error: String(e?.message || e),
+    });
   }
 });
 
@@ -136,4 +163,3 @@ app.listen(PORT, () => {
   console.log(`AWS_REGION=${AWS_REGION}`);
   console.log(`S3_BUCKET=${S3_BUCKET || "(missing)"}`);
 });
-
