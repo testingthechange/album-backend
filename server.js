@@ -1,7 +1,7 @@
 // server.js
 import express from "express";
 import cors from "cors";
-import { S3Client, GetObjectCommand } from "@aws-sdk/client-s3";
+import { S3Client, GetObjectCommand, PutObjectCommand } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 
 const app = express();
@@ -13,8 +13,17 @@ const AWS_REGION = process.env.AWS_REGION || "us-west-1";
 const S3_BUCKET = process.env.S3_BUCKET || process.env.AWS_S3_BUCKET || "";
 const SIGNED_URL_EXPIRES_SECONDS = Number(process.env.SIGNED_URL_EXPIRES_SECONDS || 1200);
 
+// New: upload presign TTL (keep short)
+const UPLOAD_SIGNED_URL_EXPIRES_SECONDS = Number(process.env.UPLOAD_SIGNED_URL_EXPIRES_SECONDS || 300);
+
 // Your Project page shows: public/players/<shareId>/manifest.json
 const PUBLISHED_PREFIX = (process.env.PUBLISHED_PREFIX || "public/players").replace(/^\/+|\/+$/g, "");
+
+// New: where catalog uploads should go in S3
+const CATALOG_UPLOAD_PREFIX = (process.env.CATALOG_UPLOAD_PREFIX || "storage/projects").replace(
+  /^\/+|\/+$/g,
+  ""
+);
 
 const ALLOWED_ORIGINS = [
   "https://blackout-web.onrender.com",
@@ -72,9 +81,85 @@ function safeNum(v) {
   return Number.isFinite(n) ? n : 0;
 }
 
+function safeFilename(name) {
+  const s = safeStr(name);
+  // keep it simple + safe for S3 keys
+  return s.replace(/[^a-zA-Z0-9._-]/g, "_").slice(0, 180) || "file";
+}
+
+function safeExtFromContentType(ct) {
+  const t = safeStr(ct).toLowerCase();
+  if (t.includes("audio/wav")) return ".wav";
+  if (t.includes("audio/x-wav")) return ".wav";
+  if (t.includes("audio/mpeg")) return ".mp3";
+  if (t.includes("audio/mp3")) return ".mp3";
+  if (t.includes("audio/flac")) return ".flac";
+  if (t.includes("audio/aac")) return ".aac";
+  if (t.includes("audio/mp4")) return ".m4a";
+  if (t.includes("image/png")) return ".png";
+  if (t.includes("image/jpeg")) return ".jpg";
+  if (t.includes("image/webp")) return ".webp";
+  return "";
+}
+
 // ---------- ROUTES ----------
 app.get("/api/health", (req, res) => {
-  res.json({ ok: true, service: "album-backend", version: 1 });
+  res.json({ ok: true, service: "album-backend", version: 2 });
+});
+
+/**
+ * NEW: Presign an upload (frontend uploads directly to S3 via PUT)
+ * POST /api/presign-upload?projectId=348697&filename=mySong.wav&contentType=audio/wav&kind=audio|cover
+ *
+ * Returns: { ok, uploadUrl, s3Key, bucket, expiresSeconds }
+ */
+app.post("/api/presign-upload", async (req, res) => {
+  try {
+    const projectId = safeStr(req.query.projectId);
+    const filenameRaw = safeStr(req.query.filename);
+    const contentType = firstNonEmpty(req.query.contentType, "application/octet-stream");
+    const kind = firstNonEmpty(req.query.kind, "audio"); // "audio" | "cover" (optional)
+
+    if (!projectId) return res.status(400).json({ ok: false, error: "missing projectId" });
+    if (!filenameRaw) return res.status(400).json({ ok: false, error: "missing filename" });
+
+    const bucket = must(S3_BUCKET, "Missing env S3_BUCKET (or AWS_S3_BUCKET)");
+
+    const filename = safeFilename(filenameRaw);
+    const ext = safeExtFromContentType(contentType);
+    const base = filename.includes(".") ? filename : filename + (ext || "");
+
+    const stamp = Date.now();
+    const safeKind = kind === "cover" ? "cover" : "audio";
+
+    // Example:
+    // storage/projects/348697/catalog/audio/170...-mysong.wav
+    const s3Key = `${CATALOG_UPLOAD_PREFIX}/${projectId}/catalog/${safeKind}/${stamp}-${base}`;
+
+    const cmd = new PutObjectCommand({
+      Bucket: bucket,
+      Key: s3Key,
+      ContentType: safeStr(contentType) || "application/octet-stream",
+      // Optional but useful for debugging / lifecycle rules
+      Metadata: {
+        projectId,
+        kind: safeKind,
+        originalFilename: filename.slice(0, 120),
+      },
+    });
+
+    const uploadUrl = await getSignedUrl(s3, cmd, { expiresIn: UPLOAD_SIGNED_URL_EXPIRES_SECONDS });
+
+    return res.json({
+      ok: true,
+      bucket,
+      s3Key,
+      uploadUrl,
+      expiresSeconds: UPLOAD_SIGNED_URL_EXPIRES_SECONDS,
+    });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
 });
 
 /**
@@ -135,12 +220,7 @@ app.get("/api/publish/:shareId/manifest", async (req, res) => {
           b?.cover?.s3Key
         );
 
-        coverUrl = firstNonEmpty(
-          b?.album?.coverUrl,
-          b?.album?.coverArtUrl,
-          b?.coverUrl,
-          b?.cover?.url
-        );
+        coverUrl = firstNonEmpty(b?.album?.coverUrl, b?.album?.coverArtUrl, b?.coverUrl, b?.cover?.url);
       } catch {
         // best effort only; ignore if not present
       }
@@ -199,4 +279,6 @@ app.listen(PORT, () => {
   console.log(`AWS_REGION=${AWS_REGION}`);
   console.log(`S3_BUCKET=${S3_BUCKET || "(missing)"}`);
   console.log(`PUBLISHED_PREFIX=${PUBLISHED_PREFIX}`);
+  console.log(`CATALOG_UPLOAD_PREFIX=${CATALOG_UPLOAD_PREFIX}`);
+  console.log(`UPLOAD_SIGNED_URL_EXPIRES_SECONDS=${UPLOAD_SIGNED_URL_EXPIRES_SECONDS}`);
 });
