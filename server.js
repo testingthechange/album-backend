@@ -9,16 +9,17 @@
 //
 // DO NOT remove allowedHeaders entries.
 // DO NOT remove either upload route.
+//
+// EXTRA HARDENING:
+// - Frontend sometimes forgets to send s3Key.
+// - Backend now auto-generates a safe s3Key when missing.
+//   This prevents "missing s3Key" from breaking uploads again.
 // ------------------------------------------------------------
 
 import express from "express";
 import cors from "cors";
 import multer from "multer";
-import {
-  S3Client,
-  PutObjectCommand,
-  GetObjectCommand,
-} from "@aws-sdk/client-s3";
+import { S3Client, PutObjectCommand, GetObjectCommand } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 
 const app = express();
@@ -28,9 +29,7 @@ app.use(express.json());
 const PORT = process.env.PORT || 10000;
 const AWS_REGION = process.env.AWS_REGION || "us-west-1";
 const S3_BUCKET = process.env.S3_BUCKET || process.env.AWS_S3_BUCKET || "";
-const SIGNED_URL_EXPIRES_SECONDS = Number(
-  process.env.SIGNED_URL_EXPIRES_SECONDS || 1200
-);
+const SIGNED_URL_EXPIRES_SECONDS = Number(process.env.SIGNED_URL_EXPIRES_SECONDS || 1200);
 
 // ---------- CORS (CRITICAL) ----------
 app.use(
@@ -62,6 +61,21 @@ function must(v, msg) {
   return v;
 }
 
+function safeName(name) {
+  return String(name || "upload").replace(/[^a-zA-Z0-9._-]+/g, "_");
+}
+
+function isoForKey() {
+  return new Date().toISOString().replace(/[:.]/g, "-");
+}
+
+function guessBucketPrefix({ projectId, mimetype }) {
+  const mt = String(mimetype || "").toLowerCase();
+  if (mt.startsWith("image/")) return `storage/projects/${projectId}/album/cover`;
+  if (mt.startsWith("audio/")) return `storage/projects/${projectId}/catalog/audio`;
+  return `storage/projects/${projectId}/uploads`;
+}
+
 // ---------- HEALTH ----------
 app.get("/api/health", (req, res) => {
   res.json({
@@ -82,13 +96,17 @@ async function uploadToS3Handler(req, res) {
     }
 
     const file = req.file;
-    const s3Key = String(req.body?.s3Key || "").trim();
-
     if (!file) {
       return res.status(400).json({ ok: false, error: "missing file" });
     }
+
+    // Frontend SHOULD send s3Key, but sometimes doesn't.
+    // Auto-generate a safe key to prevent failures.
+    let s3Key = String(req.body?.s3Key || "").trim();
     if (!s3Key) {
-      return res.status(400).json({ ok: false, error: "missing s3Key" });
+      const prefix = guessBucketPrefix({ projectId, mimetype: file.mimetype });
+      const name = safeName(file.originalname || "upload");
+      s3Key = `${prefix}/${isoForKey()}__${name}`;
     }
 
     const bucket = must(S3_BUCKET, "Missing env S3_BUCKET");
@@ -155,10 +173,7 @@ app.post("/api/master-save", async (req, res) => {
       return res.status(400).json({ ok: false, error: "missing payload" });
     }
 
-    const key = `storage/projects/${projectId}/master_save_snapshots/${new Date()
-      .toISOString()
-      .replace(/[:.]/g, "-")}.json`;
-
+    const key = `storage/projects/${projectId}/master_save_snapshots/${isoForKey()}.json`;
     const bucket = must(S3_BUCKET, "Missing env S3_BUCKET");
 
     await s3.send(
