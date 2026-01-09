@@ -201,3 +201,76 @@ app.listen(PORT, () => {
   console.log(`AWS_REGION=${AWS_REGION}`);
   console.log(`S3_BUCKET=${S3_BUCKET || "(missing)"}`);
 });
+// ---------- PUBLISH MINISITE ----------
+app.post("/api/publish-minisite", async (req, res) => {
+  try {
+    const { projectId, snapshotKey } = req.body || {};
+    if (!projectId || !snapshotKey) {
+      return res.status(400).json({ ok: false, error: "projectId and snapshotKey are required" });
+    }
+
+    const bucket = must(S3_BUCKET, "Missing env S3_BUCKET");
+
+    // Create a shareId and write a minimal manifest to S3
+    const crypto = await import("crypto");
+    const shareId = crypto.randomBytes(8).toString("hex");
+    const baseKey = `public/players/${shareId}`;
+
+    const manifest = {
+      ok: true,
+      projectId,
+      snapshotKey,
+      shareId,
+      publishedAt: new Date().toISOString(),
+      version: 1,
+    };
+
+    await s3.send(
+      new PutObjectCommand({
+        Bucket: bucket,
+        Key: `${baseKey}/manifest.json`,
+        Body: JSON.stringify(manifest, null, 2),
+        ContentType: "application/json; charset=utf-8",
+        CacheControl: "no-store",
+      })
+    );
+
+    // Minimal index.html that shows the manifest
+    const html = `<!doctype html>
+<html>
+<head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Smart Bridge Minisite</title></head>
+<body>
+<h3>Smart Bridge Minisite</h3>
+<p>This share points at a Master Save snapshot.</p>
+<pre id="out">Loading manifest…</pre>
+<script>
+fetch("./manifest.json").then(r=>r.json()).then(m=>{
+  document.getElementById("out").textContent = JSON.stringify(m,null,2);
+}).catch(err=>{
+  document.getElementById("out").textContent = String(err);
+});
+</script>
+</body>
+</html>`;
+
+    await s3.send(
+      new PutObjectCommand({
+        Bucket: bucket,
+        Key: `${baseKey}/index.html`,
+        Body: html,
+        ContentType: "text/html; charset=utf-8",
+        CacheControl: "no-store",
+      })
+    );
+
+    // Optional: if you later set a real public base URL, use it here
+    const PUBLIC_BASE = process.env.PUBLIC_PLAYERS_BASE_URL || "";
+    const publicUrl = PUBLIC_BASE ? `${PUBLIC_BASE}/${baseKey}/index.html` : `/${baseKey}/index.html`;
+
+    return res.json({ ok: true, shareId, publicUrl, manifestKey: `${baseKey}/manifest.json` });
+  } catch (e) {
+    console.error("publish-minisite error:", e);
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
+});
