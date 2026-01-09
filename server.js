@@ -1,29 +1,23 @@
 // server.js
 // ------------------------------------------------------------
-// IMPORTANT NOTE (2026-01-06)
+// IMPORTANT NOTE (2026-01-06..2026-01-09)
 //
 // Upload + cover upload + album audio all depend on this file.
-//
-// Frontend sends custom headers (X-Project-Id, etc).
-// If CORS does NOT allow them, uploads fail with CORS error.
+// Master Save + Publish minisite depend on this file.
 //
 // DO NOT remove allowedHeaders entries.
 // DO NOT remove either upload route.
-//
-// EXTRA HARDENING:
-// - Frontend sometimes forgets to send s3Key.
-// - Backend now auto-generates a safe s3Key when missing.
-//   This prevents "missing s3Key" from breaking uploads again.
 // ------------------------------------------------------------
 
 import express from "express";
 import cors from "cors";
 import multer from "multer";
+import crypto from "crypto";
 import { S3Client, PutObjectCommand, GetObjectCommand } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: "10mb" }));
 
 // ---------- ENV ----------
 const PORT = process.env.PORT || 10000;
@@ -31,18 +25,16 @@ const AWS_REGION = process.env.AWS_REGION || "us-west-1";
 const S3_BUCKET = process.env.S3_BUCKET || process.env.AWS_S3_BUCKET || "";
 const SIGNED_URL_EXPIRES_SECONDS = Number(process.env.SIGNED_URL_EXPIRES_SECONDS || 1200);
 
+// OPTIONAL: used to produce a clickable URL in publish response.
+// If not set, we return a relative /public/players/... path.
+const PUBLIC_PLAYERS_BASE_URL = String(process.env.PUBLIC_PLAYERS_BASE_URL || "").replace(/\/+$/, "");
+
 // ---------- CORS (CRITICAL) ----------
 app.use(
   cors({
     origin: (origin, cb) => cb(null, true),
     methods: ["GET", "POST", "OPTIONS"],
-    allowedHeaders: [
-      "Content-Type",
-      "Authorization",
-      "X-Project-Id",
-      "X-ProjectId",
-      "X-SB-Project-Id",
-    ],
+    allowedHeaders: ["Content-Type", "Authorization", "X-Project-Id", "X-ProjectId", "X-SB-Project-Id"],
   })
 );
 
@@ -76,14 +68,29 @@ function guessBucketPrefix({ projectId, mimetype }) {
   return `storage/projects/${projectId}/uploads`;
 }
 
+async function putObject({ key, body, contentType }) {
+  const bucket = must(S3_BUCKET, "Missing env S3_BUCKET");
+  await s3.send(
+    new PutObjectCommand({
+      Bucket: bucket,
+      Key: key,
+      Body: body,
+      ContentType: contentType,
+      CacheControl: "no-store",
+    })
+  );
+}
+
 // ---------- HEALTH ----------
 app.get("/api/health", (req, res) => {
   res.json({
     ok: true,
     service: "album-backend",
     uploadRoutes: ["/upload-to-s3", "/api/upload-to-s3"],
+    playbackRoute: "/api/playback-url",
     masterSaveRoute: "/api/master-save",
-    note: "Do not remove upload routes or CORS headers",
+    publishRoute: "/api/publish-minisite",
+    PUBLIC_PLAYERS_BASE_URL,
   });
 });
 
@@ -91,17 +98,12 @@ app.get("/api/health", (req, res) => {
 async function uploadToS3Handler(req, res) {
   try {
     const projectId = String(req.query.projectId || "").trim();
-    if (!projectId) {
-      return res.status(400).json({ ok: false, error: "missing projectId" });
-    }
+    if (!projectId) return res.status(400).json({ ok: false, error: "missing projectId" });
 
     const file = req.file;
-    if (!file) {
-      return res.status(400).json({ ok: false, error: "missing file" });
-    }
+    if (!file) return res.status(400).json({ ok: false, error: "missing file" });
 
     // Frontend SHOULD send s3Key, but sometimes doesn't.
-    // Auto-generate a safe key to prevent failures.
     let s3Key = String(req.body?.s3Key || "").trim();
     if (!s3Key) {
       const prefix = guessBucketPrefix({ projectId, mimetype: file.mimetype });
@@ -110,26 +112,20 @@ async function uploadToS3Handler(req, res) {
     }
 
     const bucket = must(S3_BUCKET, "Missing env S3_BUCKET");
-
     await s3.send(
       new PutObjectCommand({
         Bucket: bucket,
         Key: s3Key,
         Body: file.buffer,
         ContentType: file.mimetype || "application/octet-stream",
-        Metadata: {
-          projectid: projectId,
-        },
+        Metadata: { projectid: projectId },
       })
     );
 
     return res.json({ ok: true, bucket, s3Key });
   } catch (e) {
     console.error("upload-to-s3 error:", e);
-    return res.status(500).json({
-      ok: false,
-      error: String(e?.message || e),
-    });
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
   }
 }
 
@@ -141,27 +137,16 @@ app.post("/api/upload-to-s3", upload.single("file"), uploadToS3Handler);
 app.get("/api/playback-url", async (req, res) => {
   try {
     const s3Key = String(req.query.s3Key || "").trim();
-    if (!s3Key) {
-      return res.status(400).json({ ok: false, error: "missing s3Key" });
-    }
+    if (!s3Key) return res.status(400).json({ ok: false, error: "missing s3Key" });
 
     const bucket = must(S3_BUCKET, "Missing env S3_BUCKET");
     const cmd = new GetObjectCommand({ Bucket: bucket, Key: s3Key });
 
-    const url = await getSignedUrl(s3, cmd, {
-      expiresIn: SIGNED_URL_EXPIRES_SECONDS,
-    });
+    const url = await getSignedUrl(s3, cmd, { expiresIn: SIGNED_URL_EXPIRES_SECONDS });
 
-    return res.json({
-      ok: true,
-      url,
-      expiresSeconds: SIGNED_URL_EXPIRES_SECONDS,
-    });
+    return res.json({ ok: true, url, expiresSeconds: SIGNED_URL_EXPIRES_SECONDS });
   } catch (e) {
-    return res.status(500).json({
-      ok: false,
-      error: String(e?.message || e),
-    });
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
   }
 });
 
@@ -169,38 +154,22 @@ app.get("/api/playback-url", async (req, res) => {
 app.post("/api/master-save", async (req, res) => {
   try {
     const { projectId, project } = req.body || {};
-    if (!projectId || !project) {
-      return res.status(400).json({ ok: false, error: "missing payload" });
-    }
+    if (!projectId || !project) return res.status(400).json({ ok: false, error: "missing payload" });
 
     const key = `storage/projects/${projectId}/master_save_snapshots/${isoForKey()}.json`;
-    const bucket = must(S3_BUCKET, "Missing env S3_BUCKET");
-
-    await s3.send(
-      new PutObjectCommand({
-        Bucket: bucket,
-        Key: key,
-        Body: JSON.stringify(project, null, 2),
-        ContentType: "application/json",
-      })
-    );
+    await putObject({
+      key,
+      body: Buffer.from(JSON.stringify(project, null, 2)),
+      contentType: "application/json; charset=utf-8",
+    });
 
     return res.json({ ok: true, snapshotKey: key });
   } catch (e) {
     console.error("master-save error:", e);
-    return res.status(500).json({
-      ok: false,
-      error: String(e?.message || e),
-    });
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
   }
 });
 
-// ---------- START ----------
-app.listen(PORT, () => {
-  console.log(`album-backend listening on ${PORT}`);
-  console.log(`AWS_REGION=${AWS_REGION}`);
-  console.log(`S3_BUCKET=${S3_BUCKET || "(missing)"}`);
-});
 // ---------- PUBLISH MINISITE ----------
 app.post("/api/publish-minisite", async (req, res) => {
   try {
@@ -209,10 +178,6 @@ app.post("/api/publish-minisite", async (req, res) => {
       return res.status(400).json({ ok: false, error: "projectId and snapshotKey are required" });
     }
 
-    const bucket = must(S3_BUCKET, "Missing env S3_BUCKET");
-
-    // Create a shareId and write a minimal manifest to S3
-    const crypto = await import("crypto");
     const shareId = crypto.randomBytes(8).toString("hex");
     const baseKey = `public/players/${shareId}`;
 
@@ -225,52 +190,59 @@ app.post("/api/publish-minisite", async (req, res) => {
       version: 1,
     };
 
-    await s3.send(
-      new PutObjectCommand({
-        Bucket: bucket,
-        Key: `${baseKey}/manifest.json`,
-        Body: JSON.stringify(manifest, null, 2),
-        ContentType: "application/json; charset=utf-8",
-        CacheControl: "no-store",
-      })
-    );
+    const manifestKey = `${baseKey}/manifest.json`;
+    await putObject({
+      key: manifestKey,
+      body: Buffer.from(JSON.stringify(manifest, null, 2)),
+      contentType: "application/json; charset=utf-8",
+    });
 
-    // Minimal index.html that shows the manifest
     const html = `<!doctype html>
 <html>
-<head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>Smart Bridge Minisite</title></head>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Smart Bridge Minisite</title>
+</head>
 <body>
-<h3>Smart Bridge Minisite</h3>
-<p>This share points at a Master Save snapshot.</p>
-<pre id="out">Loading manifest…</pre>
-<script>
-fetch("./manifest.json").then(r=>r.json()).then(m=>{
-  document.getElementById("out").textContent = JSON.stringify(m,null,2);
-}).catch(err=>{
-  document.getElementById("out").textContent = String(err);
-});
-</script>
+  <h3>Smart Bridge Minisite</h3>
+  <p>This share points at a Master Save snapshot.</p>
+  <pre id="out">Loading manifest…</pre>
+  <script>
+    fetch("./manifest.json")
+      .then(r => r.json())
+      .then(m => {
+        document.getElementById("out").textContent = JSON.stringify(m, null, 2);
+      })
+      .catch(err => {
+        document.getElementById("out").textContent = String(err);
+      });
+  </script>
 </body>
 </html>`;
 
-    await s3.send(
-      new PutObjectCommand({
-        Bucket: bucket,
-        Key: `${baseKey}/index.html`,
-        Body: html,
-        ContentType: "text/html; charset=utf-8",
-        CacheControl: "no-store",
-      })
-    );
+    const indexKey = `${baseKey}/index.html`;
+    await putObject({
+      key: indexKey,
+      body: Buffer.from(html),
+      contentType: "text/html; charset=utf-8",
+    });
 
-    // Optional: if you later set a real public base URL, use it here
-    const PUBLIC_BASE = process.env.PUBLIC_PLAYERS_BASE_URL || "";
-    const publicUrl = PUBLIC_BASE ? `${PUBLIC_BASE}/${baseKey}/index.html` : `/${baseKey}/index.html`;
+    const publicUrl = PUBLIC_PLAYERS_BASE_URL
+      ? `${PUBLIC_PLAYERS_BASE_URL}/${baseKey}/index.html`
+      : `/${baseKey}/index.html`;
 
-    return res.json({ ok: true, shareId, publicUrl, manifestKey: `${baseKey}/manifest.json` });
+    return res.json({ ok: true, shareId, publicUrl, manifestKey });
   } catch (e) {
     console.error("publish-minisite error:", e);
-    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+    return res.status(500).json({ ok: false, error: e?.message || String(e) });
   }
+});
+
+// ---------- START ----------
+app.listen(PORT, () => {
+  console.log(`album-backend listening on ${PORT}`);
+  console.log(`AWS_REGION=${AWS_REGION}`);
+  console.log(`S3_BUCKET=${S3_BUCKET || "(missing)"}`);
+  console.log(`PUBLIC_PLAYERS_BASE_URL=${PUBLIC_PLAYERS_BASE_URL || "(empty)"}`);
 });
