@@ -1,4 +1,4 @@
-// server.js
+// FILE: server.js
 // ------------------------------------------------------------
 // IMPORTANT NOTE (2026-01-06..2026-01-09)
 //
@@ -81,6 +81,16 @@ async function putObject({ key, body, contentType }) {
   );
 }
 
+// AWS SDK v3: stream -> string (needed for GET object bodies)
+function streamToString(stream) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    stream.on("data", (chunk) => chunks.push(Buffer.from(chunk)));
+    stream.on("error", (err) => reject(err));
+    stream.on("end", () => resolve(Buffer.concat(chunks).toString("utf-8")));
+  });
+}
+
 // ---------- HEALTH ----------
 app.get("/api/health", (req, res) => {
   res.json({
@@ -89,6 +99,7 @@ app.get("/api/health", (req, res) => {
     uploadRoutes: ["/upload-to-s3", "/api/upload-to-s3"],
     playbackRoute: "/api/playback-url",
     masterSaveRoute: "/api/master-save",
+    masterSaveLatestRoute: "/api/master-save/latest/:projectId",
     publishRoute: "/api/publish-minisite",
     PUBLIC_PLAYERS_BASE_URL,
   });
@@ -150,23 +161,83 @@ app.get("/api/playback-url", async (req, res) => {
   }
 });
 
-// ---------- MASTER SAVE ----------
+// ---------- MASTER SAVE (writes snapshot + latest pointer) ----------
 app.post("/api/master-save", async (req, res) => {
   try {
     const { projectId, project } = req.body || {};
     if (!projectId || !project) return res.status(400).json({ ok: false, error: "missing payload" });
 
-    const key = `storage/projects/${projectId}/master_save_snapshots/${isoForKey()}.json`;
+    const snapshotKey = `storage/projects/${projectId}/master_save_snapshots/${isoForKey()}.json`;
     await putObject({
-      key,
+      key: snapshotKey,
       body: Buffer.from(JSON.stringify(project, null, 2)),
       contentType: "application/json; charset=utf-8",
     });
 
-    return res.json({ ok: true, snapshotKey: key });
+    // NEW: latest pointer so the UI can load "latest"
+    const latestKey = `storage/projects/${projectId}/master_save_snapshots/latest.json`;
+    await putObject({
+      key: latestKey,
+      body: Buffer.from(
+        JSON.stringify(
+          {
+            projectId,
+            snapshotKey,
+            savedAt: new Date().toISOString(),
+          },
+          null,
+          2
+        )
+      ),
+      contentType: "application/json; charset=utf-8",
+    });
+
+    return res.json({ ok: true, snapshotKey, latestKey });
   } catch (e) {
     console.error("master-save error:", e);
     return res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
+});
+
+// ---------- MASTER SAVE LATEST (reads latest.json -> snapshot) ----------
+app.get("/api/master-save/latest/:projectId", async (req, res) => {
+  try {
+    const projectId = String(req.params.projectId || "").trim();
+    if (!projectId) return res.status(400).json({ ok: false, error: "missing projectId" });
+
+    const bucket = must(S3_BUCKET, "Missing env S3_BUCKET");
+    const latestKey = `storage/projects/${projectId}/master_save_snapshots/latest.json`;
+
+    // read latest.json
+    const latestObj = await s3.send(new GetObjectCommand({ Bucket: bucket, Key: latestKey }));
+    const latestBody = await streamToString(latestObj.Body);
+    const latest = JSON.parse(latestBody || "{}");
+
+    const snapshotKey = String(latest?.snapshotKey || "").trim();
+    if (!snapshotKey) {
+      return res.status(404).json({ ok: false, error: "NO_LATEST_SNAPSHOT_KEY", latestKey });
+    }
+
+    // read snapshot json
+    const snapObj = await s3.send(new GetObjectCommand({ Bucket: bucket, Key: snapshotKey }));
+    const snapBody = await streamToString(snapObj.Body);
+    const project = JSON.parse(snapBody || "{}");
+
+    return res.json({
+      ok: true,
+      latestKey,
+      latest,
+      snapshot: {
+        projectId,
+        savedAt: String(latest?.savedAt || ""),
+        project,
+      },
+    });
+  } catch (e) {
+    // If latest.json doesn't exist, AWS returns NoSuchKey
+    const msg = String(e?.name || "") === "NoSuchKey" ? "NO_LATEST_SNAPSHOT_KEY" : String(e?.message || e);
+    console.error("master-save latest error:", e);
+    return res.status(404).json({ ok: false, error: msg });
   }
 });
 
