@@ -311,21 +311,22 @@ app.post("/api/publish-minisite", async (req, res) => {
   }
 });
 
-// ---------- PUBLISHED MANIFEST (required by blackout-web) ----------
+// ---------- PUBLISH MANIFEST (GET) ----------
 // Frontend expects: GET /api/publish/:shareId/manifest
-// This reads: public/players/:shareId/manifest.json from S3 and returns it.
+// This reads: public/players/<shareId>/manifest.json from S3 and returns it.
 app.get("/api/publish/:shareId/manifest", async (req, res) => {
   try {
     const shareId = String(req.params.shareId || "").trim();
     if (!shareId) return res.status(400).json({ ok: false, error: "missing shareId" });
 
     const bucket = must(S3_BUCKET, "Missing env S3_BUCKET");
-    const key = `public/players/${shareId}/manifest.json`;
+    const manifestKey = `public/players/${shareId}/manifest.json`;
 
-    const obj = await s3.send(new GetObjectCommand({ Bucket: bucket, Key: key }));
+    const obj = await s3.send(new GetObjectCommand({ Bucket: bucket, Key: manifestKey }));
     const body = await streamToString(obj.Body);
-    const manifest = JSON.parse(body || "{}");
 
+    // return the manifest JSON as-is
+    const manifest = JSON.parse(body || "{}");
     return res.json(manifest);
   } catch (e) {
     const msg = String(e?.name || "") === "NoSuchKey" ? "MANIFEST_NOT_FOUND" : String(e?.message || e);
