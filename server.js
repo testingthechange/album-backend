@@ -91,6 +91,137 @@ function streamToString(stream) {
   });
 }
 
+async function getObjectJson(key) {
+  const bucket = must(S3_BUCKET, "Missing env S3_BUCKET");
+  const obj = await s3.send(new GetObjectCommand({ Bucket: bucket, Key: key }));
+  const body = await streamToString(obj.Body);
+  return JSON.parse(body || "{}");
+}
+
+function firstStr(...vals) {
+  for (const v of vals) {
+    const s = String(v ?? "").trim();
+    if (s) return s;
+  }
+  return "";
+}
+
+function firstNum(...vals) {
+  for (const v of vals) {
+    const n = Number(v);
+    if (Number.isFinite(n) && n > 0) return n;
+  }
+  return 0;
+}
+
+function extractTracksFromSnapshot(project) {
+  if (!project || typeof project !== "object") return [];
+
+  // Try a few likely shapes.
+  const candidates = [
+    project?.tracks,
+    project?.catalog?.tracks,
+    project?.catalog?.songs,
+    project?.songs,
+    project?.songs?.tracks,
+    project?.songs?.items,
+    project?.album?.tracks,
+    project?.albumBundle?.tracks,
+    project?.bundle?.tracks,
+    project?.published?.tracks,
+  ].filter(Boolean);
+
+  let arr = null;
+
+  for (const c of candidates) {
+    if (Array.isArray(c)) {
+      arr = c;
+      break;
+    }
+    // Sometimes nested objects contain arrays
+    if (c && typeof c === "object") {
+      // common: { bySlot: { "1": {...}, ... } }
+      const bySlot = c.bySlot || c.metaBySlot || c.tracksBySlot;
+      if (bySlot && typeof bySlot === "object") {
+        const keys = Object.keys(bySlot);
+        if (keys.length) {
+          arr = keys
+            .map((k) => ({ slot: Number(k), ...(bySlot[k] || {}) }))
+            .filter((x) => Number.isFinite(x.slot) && x.slot > 0);
+          if (arr.length) break;
+        }
+      }
+    }
+  }
+
+  if (!Array.isArray(arr)) return [];
+
+  return arr.map((t, i) => {
+    const slot = Number(t?.slot ?? t?.trackNumber ?? t?.index ?? i + 1) || i + 1;
+
+    const title = firstStr(
+      t?.title,
+      t?.name,
+      t?.songTitle,
+      t?.trackTitle,
+      t?.meta?.title
+    ) || "Untitled";
+
+    const s3Key = firstStr(
+      t?.s3Key,
+      t?.audioS3Key,
+      t?.audio?.s3Key,
+      t?.audioKey,
+      t?.file?.s3Key,
+      t?.fileKey,
+      t?.asset?.s3Key
+    );
+
+    const durationSec = firstNum(
+      t?.durationSec,
+      t?.duration,
+      t?.audio?.durationSec,
+      t?.meta?.durationSec
+    );
+
+    const lyricsText = firstStr(t?.lyricsText, t?.lyrics, t?.meta?.lyricsText, t?.meta?.lyrics);
+    const creditsText = firstStr(t?.creditsText, t?.credits, t?.meta?.creditsText, t?.meta?.credits);
+
+    return {
+      slot,
+      title,
+      s3Key,
+      durationSec,
+      lyricsText: lyricsText || undefined,
+      creditsText: creditsText || undefined,
+    };
+  });
+}
+
+function extractMetaBySlot(project) {
+  const meta =
+    project?.metaBySlot ||
+    project?.meta?.bySlot ||
+    project?.songsMetaBySlot ||
+    project?.meta?.songsBySlot ||
+    null;
+
+  if (!meta || typeof meta !== "object") return undefined;
+
+  // Ensure numeric-ish keys -> object with lyrics/credits
+  const out = {};
+  for (const [k, v] of Object.entries(meta)) {
+    const n = Number(k);
+    if (!Number.isFinite(n) || n <= 0) continue;
+    if (!v || typeof v !== "object") continue;
+    out[n] = {
+      lyrics: firstStr(v?.lyrics, v?.lyricsText),
+      credits: firstStr(v?.credits, v?.creditsText),
+    };
+  }
+  return Object.keys(out).length ? out : undefined;
+}
+
 // ---------- HEALTH ----------
 app.get("/api/health", (req, res) => {
   res.json({
@@ -311,25 +442,73 @@ app.post("/api/publish-minisite", async (req, res) => {
   }
 });
 
-// ---------- PUBLISH MANIFEST (GET) ----------
-// Frontend expects: GET /api/publish/:shareId/manifest
-// This reads: public/players/<shareId>/manifest.json from S3 and returns it.
+// ---------- PUBLISHED MANIFEST FOR WEB APP (MUST INCLUDE tracks[]) ----------
+// The blackout-web UI calls:
+//   GET {VITE_ALBUM_BACKEND_URL}/api/publish/:shareId/manifest
+// and expects: { ok:true, tracks:[...], albumName, coverUrl/coverS3Key, ... }
 app.get("/api/publish/:shareId/manifest", async (req, res) => {
   try {
     const shareId = String(req.params.shareId || "").trim();
     if (!shareId) return res.status(400).json({ ok: false, error: "missing shareId" });
 
-    const bucket = must(S3_BUCKET, "Missing env S3_BUCKET");
-    const manifestKey = `public/players/${shareId}/manifest.json`;
+    const pointerKey = `public/players/${shareId}/manifest.json`;
 
-    const obj = await s3.send(new GetObjectCommand({ Bucket: bucket, Key: manifestKey }));
-    const body = await streamToString(obj.Body);
+    // 1) read publish pointer (contains snapshotKey)
+    const pointer = await getObjectJson(pointerKey);
 
-    // return the manifest JSON as-is
-    const manifest = JSON.parse(body || "{}");
-    return res.json(manifest);
+    const snapshotKey = String(pointer?.snapshotKey || "").trim();
+    if (!snapshotKey) {
+      return res.status(404).json({ ok: false, error: "PUBLISH_POINTER_MISSING_SNAPSHOT_KEY", pointerKey, pointer });
+    }
+
+    // 2) read snapshot project JSON
+    const project = await getObjectJson(snapshotKey);
+
+    // 3) extract UI-friendly fields
+    const albumName = firstStr(
+      project?.albumName,
+      project?.albumTitle,
+      project?.title,
+      project?.album?.name,
+      project?.album?.title,
+      project?.meta?.albumName,
+      project?.meta?.albumTitle
+    );
+
+    const performers = firstStr(project?.performers, project?.artist, project?.album?.artist, project?.meta?.performers);
+    const releaseDate = firstStr(project?.releaseDate, project?.album?.releaseDate, project?.meta?.releaseDate);
+
+    const coverUrl = firstStr(project?.coverUrl, project?.album?.coverUrl, project?.meta?.coverUrl);
+    const coverS3Key = firstStr(project?.coverS3Key, project?.album?.coverS3Key, project?.meta?.coverS3Key);
+
+    const tracks = extractTracksFromSnapshot(project);
+
+    // Optional meta-by-slot (lyrics/credits)
+    const metaBySlot = extractMetaBySlot(project);
+
+    // 4) respond in the shape blackout-web expects
+    res.setHeader("Cache-Control", "no-store");
+    return res.json({
+      ok: true,
+      shareId,
+      projectId: String(pointer?.projectId || project?.projectId || ""),
+      snapshotKey,
+      publishedAt: String(pointer?.publishedAt || ""),
+      version: Number(pointer?.version || 1),
+
+      albumName: albumName || "Album",
+      performers: performers || undefined,
+      releaseDate: releaseDate || undefined,
+
+      coverUrl: coverUrl || undefined,
+      coverS3Key: coverS3Key || undefined,
+
+      tracks,
+      metaBySlot: metaBySlot || undefined,
+    });
   } catch (e) {
-    const msg = String(e?.name || "") === "NoSuchKey" ? "MANIFEST_NOT_FOUND" : String(e?.message || e);
+    const msg = String(e?.name || "") === "NoSuchKey" ? "NO_SUCH_SHARE" : String(e?.message || e);
+    console.error("publish manifest error:", e);
     return res.status(404).json({ ok: false, error: msg });
   }
 });
