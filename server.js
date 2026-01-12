@@ -101,6 +101,7 @@ app.get("/api/health", (req, res) => {
     masterSaveRoute: "/api/master-save",
     masterSaveLatestRoute: "/api/master-save/latest/:projectId",
     publishRoute: "/api/publish-minisite",
+    publishManifestRoute: "/api/publish/:shareId/manifest",
     PUBLIC_PLAYERS_BASE_URL,
   });
 });
@@ -307,6 +308,28 @@ app.post("/api/publish-minisite", async (req, res) => {
   } catch (e) {
     console.error("publish-minisite error:", e);
     return res.status(500).json({ ok: false, error: e?.message || String(e) });
+  }
+});
+
+// ---------- PUBLISHED MANIFEST (required by blackout-web) ----------
+// Frontend expects: GET /api/publish/:shareId/manifest
+// This reads: public/players/:shareId/manifest.json from S3 and returns it.
+app.get("/api/publish/:shareId/manifest", async (req, res) => {
+  try {
+    const shareId = String(req.params.shareId || "").trim();
+    if (!shareId) return res.status(400).json({ ok: false, error: "missing shareId" });
+
+    const bucket = must(S3_BUCKET, "Missing env S3_BUCKET");
+    const key = `public/players/${shareId}/manifest.json`;
+
+    const obj = await s3.send(new GetObjectCommand({ Bucket: bucket, Key: key }));
+    const body = await streamToString(obj.Body);
+    const manifest = JSON.parse(body || "{}");
+
+    return res.json(manifest);
+  } catch (e) {
+    const msg = String(e?.name || "") === "NoSuchKey" ? "MANIFEST_NOT_FOUND" : String(e?.message || e);
+    return res.status(404).json({ ok: false, error: msg });
   }
 });
 
