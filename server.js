@@ -1,6 +1,6 @@
-// FILE: server.js
+// FILE: album-backend/server.js
 // ------------------------------------------------------------
-// IMPORTANT NOTE (2026-01-06..2026-01-09)
+// IMPORTANT NOTE (2026-01-06..2026-01-12)
 //
 // Upload + cover upload + album audio all depend on this file.
 // Master Save + Publish minisite depend on this file.
@@ -114,10 +114,13 @@ function firstNum(...vals) {
   return 0;
 }
 
+/**
+ * Extract tracks from snapshot and ONLY return tracks that actually have audio (s3Key).
+ * This prevents showing empty slots (1..9) when only 3-4 tracks were uploaded.
+ */
 function extractTracksFromSnapshot(project) {
   if (!project || typeof project !== "object") return [];
 
-  // Try a bunch of likely shapes (we keep these permissive).
   const candidates = [
     project?.tracks,
     project?.catalog?.tracks,
@@ -126,10 +129,10 @@ function extractTracksFromSnapshot(project) {
     project?.songs?.tracks,
     project?.songs?.items,
     project?.album?.tracks,
+    project?.album?.albumMode?.tracks,
     project?.albumBundle?.tracks,
     project?.bundle?.tracks,
     project?.published?.tracks,
-    project?.snapshot?.tracks,
   ].filter(Boolean);
 
   let arr = null;
@@ -155,39 +158,46 @@ function extractTracksFromSnapshot(project) {
 
   if (!Array.isArray(arr)) return [];
 
-  return arr
-    .map((t, i) => {
-      const slot = Number(t?.slot ?? t?.trackNumber ?? t?.index ?? i + 1) || i + 1;
+  const normalized = arr.map((t, i) => {
+    const slot = Number(t?.slot ?? t?.trackNumber ?? t?.index ?? i + 1) || i + 1;
 
-      const title =
-        firstStr(t?.title, t?.name, t?.songTitle, t?.trackTitle, t?.meta?.title) || "Untitled";
+    const title =
+      firstStr(t?.title, t?.name, t?.songTitle, t?.trackTitle, t?.meta?.title, t?.albumTitle) || "Untitled";
 
-      const s3Key = firstStr(
-        t?.s3Key,
-        t?.audioS3Key,
-        t?.audio?.s3Key,
-        t?.audioKey,
-        t?.file?.s3Key,
-        t?.fileKey,
-        t?.asset?.s3Key,
-        t?.audioFileS3Key
-      );
+    // More audio key candidates (covers many snapshot shapes)
+    const s3Key = firstStr(
+      t?.s3Key,
+      t?.audioS3Key,
+      t?.audio?.s3Key,
+      t?.audioKey,
+      t?.file?.s3Key,
+      t?.fileKey,
+      t?.asset?.s3Key,
+      t?.audio?.key,
+      t?.audio?.s3KeyOriginal,
+      t?.audio?.s3KeyMp3,
+      t?.catalogAudioS3Key,
+      t?.catalog?.audioS3Key,
+      t?.uploads?.audioS3Key
+    );
 
-      const durationSec = firstNum(t?.durationSec, t?.duration, t?.audio?.durationSec, t?.meta?.durationSec);
+    const durationSec = firstNum(t?.durationSec, t?.duration, t?.audio?.durationSec, t?.meta?.durationSec);
 
-      const lyricsText = firstStr(t?.lyricsText, t?.lyrics, t?.meta?.lyricsText, t?.meta?.lyrics);
-      const creditsText = firstStr(t?.creditsText, t?.credits, t?.meta?.creditsText, t?.meta?.credits);
+    const lyricsText = firstStr(t?.lyricsText, t?.lyrics, t?.meta?.lyricsText, t?.meta?.lyrics);
+    const creditsText = firstStr(t?.creditsText, t?.credits, t?.meta?.creditsText, t?.meta?.credits);
 
-      return {
-        slot,
-        title,
-        s3Key,
-        durationSec,
-        lyricsText: lyricsText || undefined,
-        creditsText: creditsText || undefined,
-      };
-    })
-    .sort((a, b) => (a.slot || 0) - (b.slot || 0));
+    return {
+      slot,
+      title,
+      s3Key,
+      durationSec,
+      lyricsText: lyricsText || undefined,
+      creditsText: creditsText || undefined,
+    };
+  });
+
+  // KEY: only keep tracks that have audio.
+  return normalized.filter((t) => String(t?.s3Key || "").trim().length > 0);
 }
 
 function extractMetaBySlot(project) {
@@ -196,7 +206,6 @@ function extractMetaBySlot(project) {
     project?.meta?.bySlot ||
     project?.songsMetaBySlot ||
     project?.meta?.songsBySlot ||
-    project?.album?.metaBySlot ||
     null;
 
   if (!meta || typeof meta !== "object") return undefined;
@@ -225,8 +234,6 @@ app.get("/api/health", (req, res) => {
     masterSaveLatestRoute: "/api/master-save/latest/:projectId",
     publishRoute: "/api/publish-minisite",
     publishManifestRoute: "/api/publish/:shareId/manifest",
-    AWS_REGION,
-    S3_BUCKET: S3_BUCKET ? "(set)" : "(missing)",
     PUBLIC_PLAYERS_BASE_URL,
   });
 });
@@ -280,7 +287,7 @@ app.get("/api/playback-url", async (req, res) => {
     const cmd = new GetObjectCommand({ Bucket: bucket, Key: s3Key });
 
     const url = await getSignedUrl(s3, cmd, { expiresIn: SIGNED_URL_EXPIRES_SECONDS });
-    res.setHeader("Cache-Control", "no-store");
+
     return res.json({ ok: true, url, expiresSeconds: SIGNED_URL_EXPIRES_SECONDS });
   } catch (e) {
     return res.status(500).json({ ok: false, error: String(e?.message || e) });
@@ -300,6 +307,7 @@ app.post("/api/master-save", async (req, res) => {
       contentType: "application/json; charset=utf-8",
     });
 
+    // latest pointer for UI
     const latestKey = `storage/projects/${projectId}/master_save_snapshots/latest.json`;
     await putObject({
       key: latestKey,
@@ -320,15 +328,20 @@ app.get("/api/master-save/latest/:projectId", async (req, res) => {
     const projectId = String(req.params.projectId || "").trim();
     if (!projectId) return res.status(400).json({ ok: false, error: "missing projectId" });
 
+    const bucket = must(S3_BUCKET, "Missing env S3_BUCKET");
     const latestKey = `storage/projects/${projectId}/master_save_snapshots/latest.json`;
-    const latest = await getObjectJson(latestKey);
+
+    const latestObj = await s3.send(new GetObjectCommand({ Bucket: bucket, Key: latestKey }));
+    const latestBody = await streamToString(latestObj.Body);
+    const latest = JSON.parse(latestBody || "{}");
 
     const snapshotKey = String(latest?.snapshotKey || "").trim();
     if (!snapshotKey) return res.status(404).json({ ok: false, error: "NO_LATEST_SNAPSHOT_KEY", latestKey });
 
-    const project = await getObjectJson(snapshotKey);
+    const snapObj = await s3.send(new GetObjectCommand({ Bucket: bucket, Key: snapshotKey }));
+    const snapBody = await streamToString(snapObj.Body);
+    const project = JSON.parse(snapBody || "{}");
 
-    res.setHeader("Cache-Control", "no-store");
     return res.json({
       ok: true,
       latestKey,
@@ -342,19 +355,16 @@ app.get("/api/master-save/latest/:projectId", async (req, res) => {
   }
 });
 
-// ---------- PUBLISH MINISITE (writes pointer only) ----------
+// ---------- PUBLISH MINISITE ----------
 app.post("/api/publish-minisite", async (req, res) => {
   try {
     const { projectId, snapshotKey } = req.body || {};
-    if (!projectId || !snapshotKey) {
-      return res.status(400).json({ ok: false, error: "projectId and snapshotKey are required" });
-    }
+    if (!projectId || !snapshotKey) return res.status(400).json({ ok: false, error: "projectId and snapshotKey are required" });
 
     const shareId = crypto.randomBytes(8).toString("hex");
     const baseKey = `public/players/${shareId}`;
 
-    // This is a POINTER. Web app reads pointer -> reads snapshot -> builds real manifest response.
-    const pointer = {
+    const manifest = {
       ok: true,
       projectId,
       snapshotKey,
@@ -366,13 +376,39 @@ app.post("/api/publish-minisite", async (req, res) => {
     const manifestKey = `${baseKey}/manifest.json`;
     await putObject({
       key: manifestKey,
-      body: Buffer.from(JSON.stringify(pointer, null, 2)),
+      body: Buffer.from(JSON.stringify(manifest, null, 2)),
       contentType: "application/json; charset=utf-8",
     });
 
-    const publicUrl = PUBLIC_PLAYERS_BASE_URL
-      ? `${PUBLIC_PLAYERS_BASE_URL}/${baseKey}/index.html`
-      : `/${baseKey}/index.html`;
+    // NOTE: index.html may 403 unless your bucket policy allows public reads for index.html
+    // blackout-web loads the manifest through the backend route; index.html is optional.
+    const html = `<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Smart Bridge Minisite</title>
+</head>
+<body>
+  <h3>Smart Bridge Minisite</h3>
+  <pre id="out">Loading manifest…</pre>
+  <script>
+    fetch("./manifest.json")
+      .then(r => r.json())
+      .then(m => { document.getElementById("out").textContent = JSON.stringify(m, null, 2); })
+      .catch(err => { document.getElementById("out").textContent = String(err); });
+  </script>
+</body>
+</html>`;
+
+    const indexKey = `${baseKey}/index.html`;
+    await putObject({
+      key: indexKey,
+      body: Buffer.from(html),
+      contentType: "text/html; charset=utf-8",
+    });
+
+    const publicUrl = PUBLIC_PLAYERS_BASE_URL ? `${PUBLIC_PLAYERS_BASE_URL}/${baseKey}/index.html` : `/${baseKey}/index.html`;
 
     return res.json({ ok: true, shareId, publicUrl, manifestKey });
   } catch (e) {
@@ -381,7 +417,7 @@ app.post("/api/publish-minisite", async (req, res) => {
   }
 });
 
-// ---------- PUBLISHED MANIFEST FOR WEB APP (MUST INCLUDE tracks[]) ----------
+// ---------- PUBLISHED MANIFEST FOR WEB APP ----------
 app.get("/api/publish/:shareId/manifest", async (req, res) => {
   try {
     const shareId = String(req.params.shareId || "").trim();
@@ -389,38 +425,68 @@ app.get("/api/publish/:shareId/manifest", async (req, res) => {
 
     const pointerKey = `public/players/${shareId}/manifest.json`;
 
-    // 1) pointer -> snapshotKey
+    // 1) read publish pointer (contains snapshotKey)
     const pointer = await getObjectJson(pointerKey);
+
     const snapshotKey = String(pointer?.snapshotKey || "").trim();
     if (!snapshotKey) {
-      return res.status(404).json({ ok: false, error: "NO_SUCH_SHARE", shareId });
+      return res
+        .status(404)
+        .json({ ok: false, error: "PUBLISH_POINTER_MISSING_SNAPSHOT_KEY", pointerKey, pointer });
     }
 
-    // 2) snapshot project json
+    // 2) read snapshot project JSON
     const project = await getObjectJson(snapshotKey);
 
-    // 3) extract fields
+    // 3) extract UI-friendly fields (more candidates)
     const albumName = firstStr(
       project?.albumName,
       project?.albumTitle,
       project?.title,
+      project?.album?.albumName,
       project?.album?.name,
       project?.album?.title,
       project?.meta?.albumName,
       project?.meta?.albumTitle
     );
 
-    const performers = firstStr(project?.performers, project?.artist, project?.album?.artist, project?.meta?.performers);
+    const performers = firstStr(
+      project?.performers,
+      project?.artist,
+      project?.album?.artist,
+      project?.album?.performers,
+      project?.meta?.performers,
+      project?.meta?.artist
+    );
+
     const releaseDate = firstStr(project?.releaseDate, project?.album?.releaseDate, project?.meta?.releaseDate);
 
-    const coverUrl = firstStr(project?.coverUrl, project?.album?.coverUrl, project?.meta?.coverUrl);
-    const coverS3Key = firstStr(project?.coverS3Key, project?.album?.coverS3Key, project?.meta?.coverS3Key);
+    const coverUrl = firstStr(
+      project?.coverUrl,
+      project?.album?.coverUrl,
+      project?.meta?.coverUrl,
+      project?.album?.cover?.url,
+      project?.album?.artwork?.url,
+      project?.meta?.cover?.url
+    );
 
+    const coverS3Key = firstStr(
+      project?.coverS3Key,
+      project?.album?.coverS3Key,
+      project?.meta?.coverS3Key,
+      project?.album?.cover?.s3Key,
+      project?.album?.cover?.key,
+      project?.album?.artwork?.s3Key,
+      project?.album?.artwork?.key,
+      project?.meta?.cover?.s3Key,
+      project?.meta?.cover?.key
+    );
+
+    // tracks: filtered to only ones with s3Key
     const tracks = extractTracksFromSnapshot(project);
-    const metaBySlot = extractMetaBySlot(project);
 
-    // Helpful diagnostics: count missing keys
-    const missingKeys = tracks.filter((t) => !String(t?.s3Key || "").trim()).length;
+    // Optional meta-by-slot (lyrics/credits)
+    const metaBySlot = extractMetaBySlot(project);
 
     res.setHeader("Cache-Control", "no-store");
     return res.json({
@@ -441,10 +507,9 @@ app.get("/api/publish/:shareId/manifest", async (req, res) => {
       tracks,
       metaBySlot: metaBySlot || undefined,
 
-      // diagnostics (safe to show)
       diagnostics: {
         tracksCount: tracks.length,
-        missingS3Keys: missingKeys,
+        missingS3Keys: tracks.filter((t) => !String(t?.s3Key || "").trim()).length, // should be 0
       },
     });
   } catch (e) {
