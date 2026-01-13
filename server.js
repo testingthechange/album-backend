@@ -68,17 +68,19 @@ function guessBucketPrefix({ projectId, mimetype }) {
   return `storage/projects/${projectId}/uploads`;
 }
 
-async function putObject({ key, body, contentType, cacheControl }) {
+async function putObject({ key, body, contentType, cacheControl, contentLength }) {
   const bucket = must(S3_BUCKET, "Missing env S3_BUCKET");
-  await s3.send(
-    new PutObjectCommand({
-      Bucket: bucket,
-      Key: key,
-      Body: body,
-      ContentType: contentType,
-      CacheControl: cacheControl || "no-store",
-    })
-  );
+  const params = {
+    Bucket: bucket,
+    Key: key,
+    Body: body,
+    ContentType: contentType,
+    CacheControl: cacheControl || "no-store",
+  };
+  if (Number.isFinite(contentLength) && contentLength > 0) {
+    params.ContentLength = contentLength;
+  }
+  await s3.send(new PutObjectCommand(params));
 }
 
 // AWS SDK v3: stream -> string (needed for GET object bodies)
@@ -91,6 +93,16 @@ function streamToString(stream) {
   });
 }
 
+// ✅ NEW: stream -> Buffer (so we always know ContentLength)
+function streamToBuffer(stream) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    stream.on("data", (chunk) => chunks.push(Buffer.from(chunk)));
+    stream.on("error", (err) => reject(err));
+    stream.on("end", () => resolve(Buffer.concat(chunks)));
+  });
+}
+
 async function getObjectJson(key) {
   const bucket = must(S3_BUCKET, "Missing env S3_BUCKET");
   const obj = await s3.send(new GetObjectCommand({ Bucket: bucket, Key: key }));
@@ -98,10 +110,11 @@ async function getObjectJson(key) {
   return JSON.parse(body || "{}");
 }
 
-async function getObjectStream(key) {
+async function getObjectBuffer(key) {
   const bucket = must(S3_BUCKET, "Missing env S3_BUCKET");
   const obj = await s3.send(new GetObjectCommand({ Bucket: bucket, Key: key }));
-  return obj; // includes Body stream + ContentType + Metadata (if present)
+  const buf = await streamToBuffer(obj.Body);
+  return { buf, contentType: obj.ContentType || "application/octet-stream" };
 }
 
 function publicUrlForKey(key) {
@@ -134,13 +147,11 @@ function firstNum(...vals) {
 function extractTracksFromSnapshot(project) {
   if (!project || typeof project !== "object") return [];
 
-  // Candidates in priority order
   const candidates = [
-    project?.audio?.mp3, // masterSaveMiniSite audio list (if present)
-    project?.catalog?.songs, // catalog-driven snapshot (your current shape)
+    project?.audio?.mp3,
+    project?.catalog?.songs,
     project?.tracks,
     project?.catalog?.tracks,
-    project?.catalog?.songs,
     project?.songs,
     project?.songs?.tracks,
     project?.songs?.items,
@@ -174,7 +185,6 @@ function extractTracksFromSnapshot(project) {
         t?.albumTitle
       ) || "Untitled";
 
-    // ✅ FIX: include catalog shape: files.album.s3Key
     const s3Key = firstStr(
       t?.s3Key,
       t?.audioS3Key,
@@ -197,7 +207,6 @@ function extractTracksFromSnapshot(project) {
     );
 
     const durationSec = firstNum(t?.durationSec, t?.duration, t?.audio?.durationSec, t?.meta?.durationSec);
-
     const trackId = firstStr(t?.trackId, t?.id);
 
     return {
@@ -236,7 +245,6 @@ async function uploadToS3Handler(req, res) {
     const file = req.file;
     if (!file) return res.status(400).json({ ok: false, error: "missing file" });
 
-    // Frontend SHOULD send s3Key, but sometimes doesn't.
     let s3Key = String(req.body?.s3Key || "").trim();
     if (!s3Key) {
       const prefix = guessBucketPrefix({ projectId, mimetype: file.mimetype });
@@ -266,7 +274,7 @@ async function uploadToS3Handler(req, res) {
 app.post("/upload-to-s3", upload.single("file"), uploadToS3Handler);
 app.post("/api/upload-to-s3", upload.single("file"), uploadToS3Handler);
 
-// ---------- PLAYBACK URL (legacy; not needed post-handoff, but kept) ----------
+// ---------- PLAYBACK URL (legacy; kept) ----------
 app.get("/api/playback-url", async (req, res) => {
   try {
     const s3Key = String(req.query.s3Key || "").trim();
@@ -276,20 +284,17 @@ app.get("/api/playback-url", async (req, res) => {
     const cmd = new GetObjectCommand({ Bucket: bucket, Key: s3Key });
 
     const url = await getSignedUrl(s3, cmd, { expiresIn: SIGNED_URL_EXPIRES_SECONDS });
-
     return res.json({ ok: true, url, expiresSeconds: SIGNED_URL_EXPIRES_SECONDS });
   } catch (e) {
     return res.status(500).json({ ok: false, error: String(e?.message || e) });
   }
 });
 
-// ---------- MASTER SAVE (writes snapshot + latest pointer) ----------
+// ---------- MASTER SAVE ----------
 app.post("/api/master-save", async (req, res) => {
   try {
-    // accept both new + legacy caller shapes
     const projectId = String(req.body?.projectId || "").trim();
     const project = req.body?.project || req.body?.masterSave || req.body?.masterSave?.project || null;
-
     if (!projectId || !project) return res.status(400).json({ ok: false, error: "missing payload" });
 
     const snapshotKey = `storage/projects/${projectId}/master_save_snapshots/${isoForKey()}.json`;
@@ -306,19 +311,14 @@ app.post("/api/master-save", async (req, res) => {
       contentType: "application/json; charset=utf-8",
     });
 
-    return res.json({
-      ok: true,
-      snapshotKey,
-      latestKey,
-      s3Key: snapshotKey, // legacy alias
-    });
+    return res.json({ ok: true, snapshotKey, latestKey, s3Key: snapshotKey });
   } catch (e) {
     console.error("master-save error:", e);
     return res.status(500).json({ ok: false, error: String(e?.message || e) });
   }
 });
 
-// ---------- MASTER SAVE LATEST (reads latest.json -> snapshot) ----------
+// ---------- MASTER SAVE LATEST ----------
 app.get("/api/master-save/latest/:projectId", async (req, res) => {
   try {
     const projectId = String(req.params.projectId || "").trim();
@@ -353,25 +353,19 @@ app.get("/api/master-save/latest/:projectId", async (req, res) => {
   }
 });
 
-// ---------- PUBLISH MINISITE (HARD HANDOFF: writes full manifest + public audio copies) ----------
+// ---------- PUBLISH MINISITE (HARD HANDOFF) ----------
 app.post("/api/publish-minisite", async (req, res) => {
   try {
     const { projectId, snapshotKey } = req.body || {};
-    if (!projectId || !snapshotKey) {
-      return res.status(400).json({ ok: false, error: "projectId and snapshotKey are required" });
-    }
+    if (!projectId || !snapshotKey) return res.status(400).json({ ok: false, error: "projectId and snapshotKey are required" });
 
-    // 1) load snapshot
     const project = await getObjectJson(String(snapshotKey).trim());
 
-    // 2) shareId + base publish prefix
     const shareId = crypto.randomBytes(8).toString("hex");
     const baseKey = `public/players/${shareId}`;
 
-    // 3) extract audio-backed tracks (NOW supports catalog files.album.s3Key)
     const tracks = extractTracksFromSnapshot(project);
 
-    // 4) copy audio into public publish area + build track urls
     const publishedTracks = [];
     for (let i = 0; i < tracks.length; i++) {
       const t = tracks[i];
@@ -382,12 +376,15 @@ app.post("/api/publish-minisite", async (req, res) => {
       const fileName = safeName(`${slot}__${t.title || "track"}.mp3`);
       const dstKey = `${baseKey}/audio/${fileName}`;
 
-      const obj = await getObjectStream(srcKey);
+      // ✅ FIX: buffer first so ContentLength is always valid
+      const { buf } = await getObjectBuffer(srcKey);
+
       await putObject({
         key: dstKey,
-        body: obj.Body, // stream
+        body: buf,
         contentType: "audio/mpeg",
         cacheControl: "public, max-age=31536000, immutable",
+        contentLength: buf.length,
       });
 
       publishedTracks.push({
@@ -400,7 +397,6 @@ app.post("/api/publish-minisite", async (req, res) => {
       });
     }
 
-    // 5) manifest (self-contained)
     const manifest = {
       version: 1,
       shareId,
@@ -428,9 +424,9 @@ app.post("/api/publish-minisite", async (req, res) => {
       body: Buffer.from(JSON.stringify(manifest, null, 2)),
       contentType: "application/json; charset=utf-8",
       cacheControl: "public, max-age=31536000, immutable",
+      contentLength: Buffer.byteLength(JSON.stringify(manifest, null, 2)),
     });
 
-    // Optional index.html (debug)
     const indexKey = `${baseKey}/index.html`;
     const html = `<!doctype html>
 <html>
@@ -441,11 +437,13 @@ fetch("./manifest.json").then(r=>r.json()).then(m=>{document.getElementById("out
 .catch(e=>{document.getElementById("out").textContent=String(e);});
 </script>
 </body></html>`;
+
     await putObject({
       key: indexKey,
       body: Buffer.from(html),
       contentType: "text/html; charset=utf-8",
       cacheControl: "public, max-age=31536000, immutable",
+      contentLength: Buffer.byteLength(html),
     });
 
     const publicUrl = publicUrlForKey(indexKey);
@@ -457,7 +455,7 @@ fetch("./manifest.json").then(r=>r.json()).then(m=>{document.getElementById("out
   }
 });
 
-// ---------- PUBLISHED MANIFEST (returns the published manifest directly) ----------
+// ---------- PUBLISHED MANIFEST ----------
 app.get("/api/publish/:shareId/manifest", async (req, res) => {
   try {
     const shareId = String(req.params.shareId || "").trim();
