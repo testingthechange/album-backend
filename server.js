@@ -1,9 +1,7 @@
 // FILE: album-backend/server.js
 // ------------------------------------------------------------
-// HARD HANDOFF BACKEND
-// - Uploads
-// - Master Save snapshots
-// - Publish = FINAL data dump (manifest + public audio + cover)
+// Upload + cover upload + album audio all depend on this file.
+// Master Save + Publish minisite depend on this file.
 // ------------------------------------------------------------
 
 import express from "express";
@@ -19,210 +17,588 @@ app.use(express.json({ limit: "10mb" }));
 // ---------- ENV ----------
 const PORT = process.env.PORT || 10000;
 const AWS_REGION = process.env.AWS_REGION || "us-west-1";
-const S3_BUCKET = process.env.S3_BUCKET || "";
+const S3_BUCKET = process.env.S3_BUCKET || process.env.AWS_S3_BUCKET || "";
 const SIGNED_URL_EXPIRES_SECONDS = Number(process.env.SIGNED_URL_EXPIRES_SECONDS || 1200);
+
+// If empty, publish returns relative /public/players/... URLs
 const PUBLIC_PLAYERS_BASE_URL = String(process.env.PUBLIC_PLAYERS_BASE_URL || "").replace(/\/+$/, "");
+
+// ---------- CORS (CRITICAL) ----------
+app.use(
+  cors({
+    origin: (origin, cb) => cb(null, true),
+    methods: ["GET", "POST", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization", "X-Project-Id", "X-ProjectId", "X-SB-Project-Id"],
+  })
+);
 
 // ---------- AWS ----------
 const s3 = new S3Client({ region: AWS_REGION });
 
-// ---------- CORS ----------
-app.use(
-  cors({
-    origin: (o, cb) => cb(null, true),
-    methods: ["GET", "POST", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Authorization"],
-  })
-);
-
 // ---------- MULTER ----------
-const upload = multer({ storage: multer.memoryStorage() });
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 30 * 1024 * 1024 }, // 30MB
+});
 
 // ---------- HELPERS ----------
-const must = (v, msg) => {
+function must(v, msg) {
   if (!v) throw new Error(msg);
   return v;
-};
-
-const isoKey = () => new Date().toISOString().replace(/[:.]/g, "-");
-
-const publicUrl = (key) =>
-  PUBLIC_PLAYERS_BASE_URL ? `${PUBLIC_PLAYERS_BASE_URL}/${key}` : `/${key}`;
-
-const streamToBuffer = (s) =>
-  new Promise((res, rej) => {
-    const c = [];
-    s.on("data", (d) => c.push(Buffer.from(d)));
-    s.on("end", () => res(Buffer.concat(c)));
-    s.on("error", rej);
-  });
-
-const getJson = async (key) => {
-  const o = await s3.send(new GetObjectCommand({ Bucket: must(S3_BUCKET), Key: key }));
-  return JSON.parse((await streamToBuffer(o.Body)).toString("utf8"));
-};
-
-const put = async ({ key, body, type, cache }) =>
-  s3.send(
-    new PutObjectCommand({
-      Bucket: must(S3_BUCKET),
-      Key: key,
-      Body: body,
-      ContentType: type,
-      CacheControl: cache || "no-store",
-      ContentLength: body.length,
-    })
-  );
-
-// ---------- TRACK EXTRACTION (catalog only) ----------
-function extractTracks(project) {
-  const songs = project?.catalog?.songs;
-  if (!Array.isArray(songs)) return [];
-
-  return songs
-    .map((s) => ({
-      slot: Number(s.slot),
-      title: s.title,
-      s3Key: s?.files?.album?.s3Key || "",
-      durationSec: Number(s?.durationSec || 0),
-    }))
-    .filter((t) => t.slot > 0 && t.s3Key);
 }
 
-// ---------- COVER EXTRACTION ----------
+function safeName(name) {
+  return String(name || "upload").replace(/[^a-zA-Z0-9._-]+/g, "_");
+}
+
+function isoForKey() {
+  return new Date().toISOString().replace(/[:.]/g, "-");
+}
+
+function guessBucketPrefix({ projectId, mimetype }) {
+  const mt = String(mimetype || "").toLowerCase();
+  if (mt.startsWith("image/")) return `storage/projects/${projectId}/album/cover`;
+  if (mt.startsWith("audio/")) return `storage/projects/${projectId}/catalog/audio`;
+  return `storage/projects/${projectId}/uploads`;
+}
+
+function publicUrlForKey(key) {
+  const clean = String(key || "").replace(/^\/+/, "");
+  return PUBLIC_PLAYERS_BASE_URL ? `${PUBLIC_PLAYERS_BASE_URL}/${clean}` : `/${clean}`;
+}
+
+async function putObject({ key, body, contentType, cacheControl, contentLength }) {
+  const bucket = must(S3_BUCKET, "Missing env S3_BUCKET");
+
+  const params = {
+    Bucket: bucket,
+    Key: key,
+    Body: body,
+    ContentType: contentType || "application/octet-stream",
+    CacheControl: cacheControl || "no-store",
+  };
+  if (Number.isFinite(contentLength) && contentLength > 0) params.ContentLength = contentLength;
+
+  await s3.send(new PutObjectCommand(params));
+}
+
+function streamToString(stream) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    stream.on("data", (chunk) => chunks.push(Buffer.from(chunk)));
+    stream.on("error", (err) => reject(err));
+    stream.on("end", () => resolve(Buffer.concat(chunks).toString("utf-8")));
+  });
+}
+
+function streamToBuffer(stream) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    stream.on("data", (chunk) => chunks.push(Buffer.from(chunk)));
+    stream.on("error", (err) => reject(err));
+    stream.on("end", () => resolve(Buffer.concat(chunks)));
+  });
+}
+
+async function getObjectJson(key) {
+  const bucket = must(S3_BUCKET, "Missing env S3_BUCKET");
+  const obj = await s3.send(new GetObjectCommand({ Bucket: bucket, Key: key }));
+  const body = await streamToString(obj.Body);
+  return JSON.parse(body || "{}");
+}
+
+async function getObjectBuffer(key) {
+  const bucket = must(S3_BUCKET, "Missing env S3_BUCKET");
+  const obj = await s3.send(new GetObjectCommand({ Bucket: bucket, Key: key }));
+  const buf = await streamToBuffer(obj.Body);
+  return { buf, contentType: obj.ContentType || "application/octet-stream" };
+}
+
+function firstStr(...vals) {
+  for (const v of vals) {
+    const s = String(v ?? "").trim();
+    if (s) return s;
+  }
+  return "";
+}
+
+function firstNum(...vals) {
+  for (const v of vals) {
+    const n = Number(v);
+    if (Number.isFinite(n) && n > 0) return n;
+  }
+  return 0;
+}
+
+/**
+ * Tracks extractor that supports your CURRENT catalog snapshot shape:
+ *   project.catalog.songs[].files.album.s3Key
+ */
+function extractTracksFromSnapshot(project) {
+  if (!project || typeof project !== "object") return [];
+
+  const candidates = [
+    project?.audio?.mp3,
+    project?.catalog?.songs,
+    project?.tracks,
+    project?.catalog?.tracks,
+    project?.songs,
+    project?.songs?.tracks,
+    project?.songs?.items,
+    project?.album?.tracks,
+    project?.album?.albumMode?.tracks,
+    project?.albumBundle?.tracks,
+    project?.bundle?.tracks,
+    project?.published?.tracks,
+  ].filter(Boolean);
+
+  let arr = null;
+  for (const c of candidates) {
+    if (Array.isArray(c)) {
+      arr = c;
+      break;
+    }
+  }
+  if (!Array.isArray(arr)) return [];
+
+  const normalized = arr.map((t, i) => {
+    const slot = Number(t?.slot ?? t?.trackNumber ?? t?.index ?? i + 1) || i + 1;
+
+    const title =
+      firstStr(
+        t?.titleJson?.title,
+        t?.title,
+        t?.name,
+        t?.songTitle,
+        t?.trackTitle,
+        t?.meta?.title,
+        t?.albumTitle
+      ) || "Untitled";
+
+    const s3Key = firstStr(
+      t?.s3Key,
+      t?.audioS3Key,
+      t?.audio?.s3Key,
+      t?.audioKey,
+      t?.file?.s3Key,
+      t?.fileKey,
+      t?.asset?.s3Key,
+      t?.audio?.key,
+      t?.mp3?.s3Key,
+      t?.catalogAudioS3Key,
+
+      // ✅ catalog file shape
+      t?.files?.album?.s3Key,
+      t?.files?.album?.key,
+      t?.files?.a?.s3Key,
+      t?.files?.a?.key,
+      t?.files?.b?.s3Key,
+      t?.files?.b?.key
+    );
+
+    const durationSec = firstNum(t?.durationSec, t?.duration, t?.audio?.durationSec, t?.meta?.durationSec);
+
+    return { slot, title, s3Key, durationSec: durationSec || undefined };
+  });
+
+  return normalized.filter((t) => String(t?.s3Key || "").trim().length > 0);
+}
+
+/**
+ * Meta extractor (lyrics/credits) supports:
+ * - project.metaBySlot / project.meta.bySlot
+ * - project.catalog.songs[].meta / songs[].metaBySlot-ish fields (best-effort)
+ */
+function extractMetaBySlot(project) {
+  const direct =
+    project?.metaBySlot ||
+    project?.meta?.bySlot ||
+    project?.songsMetaBySlot ||
+    project?.meta?.songsBySlot ||
+    null;
+
+  const out = {};
+
+  // 1) Direct bySlot object
+  if (direct && typeof direct === "object") {
+    for (const [k, v] of Object.entries(direct)) {
+      const n = Number(k);
+      if (!Number.isFinite(n) || n <= 0) continue;
+      if (!v || typeof v !== "object") continue;
+
+      const lyrics = firstStr(v?.lyrics, v?.lyricsText);
+      const credits = firstStr(v?.credits, v?.creditsText);
+
+      if (lyrics || credits) out[n] = { lyrics: lyrics || undefined, credits: credits || undefined };
+    }
+  }
+
+  // 2) Catalog songs array shape
+  const songs = project?.catalog?.songs;
+  if (Array.isArray(songs)) {
+    for (const s of songs) {
+      const slot = Number(s?.slot);
+      if (!Number.isFinite(slot) || slot <= 0) continue;
+
+      const lyrics =
+        firstStr(
+          s?.meta?.lyrics,
+          s?.meta?.lyricsText,
+          s?.lyrics,
+          s?.lyricsText,
+          s?.metaBySlot?.[slot]?.lyrics,
+          s?.metaBySlot?.[slot]?.lyricsText
+        ) || "";
+
+      const credits =
+        firstStr(
+          s?.meta?.credits,
+          s?.meta?.creditsText,
+          s?.credits,
+          s?.creditsText,
+          s?.metaBySlot?.[slot]?.credits,
+          s?.metaBySlot?.[slot]?.creditsText
+        ) || "";
+
+      if (!out[slot] && (lyrics || credits)) out[slot] = { lyrics: lyrics || undefined, credits: credits || undefined };
+    }
+  }
+
+  return Object.keys(out).length ? out : undefined;
+}
+
 function extractCoverKey(project) {
-  return (
-    project?.album?.coverS3Key ||
-    project?.coverS3Key ||
-    project?.album?.cover?.s3Key ||
-    ""
+  return firstStr(
+    project?.coverS3Key,
+    project?.album?.coverS3Key,
+    project?.meta?.coverS3Key,
+    project?.album?.cover?.s3Key,
+    project?.album?.cover?.key,
+    project?.album?.artwork?.s3Key,
+    project?.album?.artwork?.key,
+    project?.meta?.cover?.s3Key,
+    project?.meta?.cover?.key
   );
 }
 
 // ---------- HEALTH ----------
-app.get("/api/health", (_, res) =>
-  res.json({ ok: true, service: "album-backend", publish: "/api/publish-minisite" })
-);
+app.get("/api/health", (req, res) => {
+  res.json({
+    ok: true,
+    service: "album-backend",
+    uploadRoutes: ["/upload-to-s3", "/api/upload-to-s3"],
+    playbackRoute: "/api/playback-url",
+    masterSaveRoute: "/api/master-save",
+    masterSaveLatestRoute: "/api/master-save/latest/:projectId",
+    publishRoute: "/api/publish-minisite",
+    publishManifestRoute: "/api/publish/:shareId/manifest",
+    PUBLIC_PLAYERS_BASE_URL,
+  });
+});
+
+// ---------- UPLOAD HANDLER ----------
+async function uploadToS3Handler(req, res) {
+  try {
+    const projectId = String(req.query.projectId || "").trim();
+    if (!projectId) return res.status(400).json({ ok: false, error: "missing projectId" });
+
+    const file = req.file;
+    if (!file) return res.status(400).json({ ok: false, error: "missing file" });
+
+    let s3Key = String(req.body?.s3Key || "").trim();
+    if (!s3Key) {
+      const prefix = guessBucketPrefix({ projectId, mimetype: file.mimetype });
+      const name = safeName(file.originalname || "upload");
+      s3Key = `${prefix}/${isoForKey()}__${name}`;
+    }
+
+    const bucket = must(S3_BUCKET, "Missing env S3_BUCKET");
+    await s3.send(
+      new PutObjectCommand({
+        Bucket: bucket,
+        Key: s3Key,
+        Body: file.buffer,
+        ContentType: file.mimetype || "application/octet-stream",
+        Metadata: { projectid: projectId },
+      })
+    );
+
+    return res.json({ ok: true, bucket, s3Key });
+  } catch (e) {
+    console.error("upload-to-s3 error:", e);
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
+}
+
+// ---------- UPLOAD ROUTES (KEEP BOTH) ----------
+app.post("/upload-to-s3", upload.single("file"), uploadToS3Handler);
+app.post("/api/upload-to-s3", upload.single("file"), uploadToS3Handler);
+
+// ---------- PLAYBACK URL (legacy; kept) ----------
+app.get("/api/playback-url", async (req, res) => {
+  try {
+    const s3Key = String(req.query.s3Key || "").trim();
+    if (!s3Key) return res.status(400).json({ ok: false, error: "missing s3Key" });
+
+    const bucket = must(S3_BUCKET, "Missing env S3_BUCKET");
+    const cmd = new GetObjectCommand({ Bucket: bucket, Key: s3Key });
+    const url = await getSignedUrl(s3, cmd, { expiresIn: SIGNED_URL_EXPIRES_SECONDS });
+
+    return res.json({ ok: true, url, expiresSeconds: SIGNED_URL_EXPIRES_SECONDS });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
+});
 
 // ---------- MASTER SAVE ----------
 app.post("/api/master-save", async (req, res) => {
   try {
-    const { projectId, project } = req.body;
-    if (!projectId || !project) throw new Error("missing payload");
+    // Accept multiple caller shapes (project or masterSave)
+    const projectId = String(req.body?.projectId || "").trim();
+    const project = req.body?.project || req.body?.masterSave || req.body?.masterSave?.project || null;
+    if (!projectId || !project) return res.status(400).json({ ok: false, error: "missing payload" });
 
-    const key = `storage/projects/${projectId}/master_save_snapshots/${isoKey()}.json`;
-    await put({ key, body: Buffer.from(JSON.stringify(project, null, 2)), type: "application/json" });
-
-    const latest = `storage/projects/${projectId}/master_save_snapshots/latest.json`;
-    await put({
-      key: latest,
-      body: Buffer.from(JSON.stringify({ projectId, snapshotKey: key })),
-      type: "application/json",
+    const snapshotKey = `storage/projects/${projectId}/master_save_snapshots/${isoForKey()}.json`;
+    await putObject({
+      key: snapshotKey,
+      body: Buffer.from(JSON.stringify(project, null, 2)),
+      contentType: "application/json; charset=utf-8",
     });
 
-    res.json({ ok: true, snapshotKey: key });
+    const latestKey = `storage/projects/${projectId}/master_save_snapshots/latest.json`;
+    await putObject({
+      key: latestKey,
+      body: Buffer.from(JSON.stringify({ projectId, snapshotKey, savedAt: new Date().toISOString() }, null, 2)),
+      contentType: "application/json; charset=utf-8",
+    });
+
+    return res.json({ ok: true, snapshotKey, latestKey, s3Key: snapshotKey });
   } catch (e) {
-    res.status(500).json({ ok: false, error: e.message });
+    console.error("master-save error:", e);
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
   }
 });
 
-// ---------- PUBLISH (FINAL HANDOFF) ----------
+// ---------- MASTER SAVE LATEST ----------
+app.get("/api/master-save/latest/:projectId", async (req, res) => {
+  try {
+    const projectId = String(req.params.projectId || "").trim();
+    if (!projectId) return res.status(400).json({ ok: false, error: "missing projectId" });
+
+    const bucket = must(S3_BUCKET, "Missing env S3_BUCKET");
+    const latestKey = `storage/projects/${projectId}/master_save_snapshots/latest.json`;
+
+    const latestObj = await s3.send(new GetObjectCommand({ Bucket: bucket, Key: latestKey }));
+    const latestBody = await streamToString(latestObj.Body);
+    const latest = JSON.parse(latestBody || "{}");
+
+    const snapshotKey = String(latest?.snapshotKey || "").trim();
+    if (!snapshotKey) return res.status(404).json({ ok: false, error: "NO_LATEST_SNAPSHOT_KEY", latestKey });
+
+    const snapObj = await s3.send(new GetObjectCommand({ Bucket: bucket, Key: snapshotKey }));
+    const snapBody = await streamToString(snapObj.Body);
+    const project = JSON.parse(snapBody || "{}");
+
+    return res.json({
+      ok: true,
+      latestKey,
+      latest,
+      latestSnapshotKey: snapshotKey,
+      latestSnapshot: { snapshotKey, savedAt: String(latest?.savedAt || "") },
+      snapshot: { projectId, savedAt: String(latest?.savedAt || ""), project },
+    });
+  } catch (e) {
+    const msg = String(e?.name || "") === "NoSuchKey" ? "NO_LATEST_SNAPSHOT_KEY" : String(e?.message || e);
+    console.error("master-save latest error:", e);
+    return res.status(404).json({ ok: false, error: msg });
+  }
+});
+
+// ---------- PUBLISH MINISITE (HARD HANDOFF: manifest + public audio + public cover) ----------
 app.post("/api/publish-minisite", async (req, res) => {
   try {
-    const { projectId, snapshotKey } = req.body;
-    if (!projectId || !snapshotKey) throw new Error("missing publish args");
-
-    const project = await getJson(snapshotKey);
-    const shareId = crypto.randomBytes(8).toString("hex");
-    const base = `public/players/${shareId}`;
-
-    // ----- COVER -----
-    let coverUrl;
-    const coverSrc = extractCoverKey(project);
-    if (coverSrc) {
-      const o = await s3.send(new GetObjectCommand({ Bucket: must(S3_BUCKET), Key: coverSrc }));
-      const buf = await streamToBuffer(o.Body);
-      const key = `${base}/cover/cover.png`;
-      await put({ key, body: buf, type: "image/png", cache: "public, max-age=31536000, immutable" });
-      coverUrl = publicUrl(key);
+    const { projectId, snapshotKey } = req.body || {};
+    if (!projectId || !snapshotKey) {
+      return res.status(400).json({ ok: false, error: "projectId and snapshotKey are required" });
     }
 
-    // ----- AUDIO -----
-    const tracks = extractTracks(project);
-    const publishedTracks = [];
+    const project = await getObjectJson(String(snapshotKey).trim());
 
-    for (const t of tracks) {
-      const o = await s3.send(new GetObjectCommand({ Bucket: must(S3_BUCKET), Key: t.s3Key }));
-      const buf = await streamToBuffer(o.Body);
-      const key = `${base}/audio/${t.slot}__${t.title}.mp3`;
-      await put({ key, body: buf, type: "audio/mpeg", cache: "public, max-age=31536000, immutable" });
+    const shareId = crypto.randomBytes(8).toString("hex");
+    const baseKey = `public/players/${shareId}`;
+
+    // ----- cover publish -----
+    let coverKey = "";
+    let coverUrl = "";
+    const srcCoverKey = extractCoverKey(project);
+
+    if (srcCoverKey) {
+      const { buf, contentType } = await getObjectBuffer(srcCoverKey);
+      const ext =
+        String(contentType || "").includes("png") ? "png" :
+        String(contentType || "").includes("webp") ? "webp" :
+        String(contentType || "").includes("jpeg") || String(contentType || "").includes("jpg") ? "jpg" :
+        "jpg";
+
+      coverKey = `${baseKey}/cover/cover.${ext}`;
+      await putObject({
+        key: coverKey,
+        body: buf,
+        contentType: contentType || "image/jpeg",
+        cacheControl: "public, max-age=31536000, immutable",
+        contentLength: buf.length,
+      });
+      coverUrl = publicUrlForKey(coverKey);
+    }
+
+    // ----- audio publish -----
+    const tracks = extractTracksFromSnapshot(project);
+    const metaBySlot = extractMetaBySlot(project);
+
+    const publishedTracks = [];
+    for (let i = 0; i < tracks.length; i++) {
+      const t = tracks[i];
+      const srcKey = String(t.s3Key || "").trim();
+      if (!srcKey) continue;
+
+      const slot = Number(t.slot || i + 1) || i + 1;
+      const fileName = safeName(`${slot}__${t.title || "track"}.mp3`);
+      const dstKey = `${baseKey}/audio/${fileName}`;
+
+      const { buf } = await getObjectBuffer(srcKey);
+
+      await putObject({
+        key: dstKey,
+        body: buf,
+        contentType: "audio/mpeg",
+        cacheControl: "public, max-age=31536000, immutable",
+        contentLength: buf.length,
+      });
+
+      const m = metaBySlot?.[slot] || undefined;
 
       publishedTracks.push({
-        slot: t.slot,
-        title: t.title,
+        slot,
+        title: t.title || "Untitled",
         durationSec: t.durationSec || undefined,
-        audioUrl: publicUrl(key),
-        audioKey: key,
+        audioUrl: publicUrlForKey(dstKey),
+        audioKey: dstKey,
+        ...(m ? { meta: m } : {}),
       });
     }
 
-    // ----- TOTAL ALBUM TIME -----
-    const totalAlbumTimeSec = publishedTracks.reduce(
-      (s, t) => s + (Number(t.durationSec) || 0),
-      0
+    const albumTitle = firstStr(
+      project?.albumName,
+      project?.albumTitle,
+      project?.title,
+      project?.album?.albumName,
+      project?.album?.title,
+      "Album"
     );
 
-    const fmt = (s) => `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
+    const artist = firstStr(
+      project?.performers,
+      project?.artist,
+      project?.album?.artist,
+      project?.album?.performers,
+      project?.meta?.performers,
+      project?.meta?.artist
+    );
 
-    // ----- MANIFEST -----
+    const releaseDate = firstStr(project?.releaseDate, project?.album?.releaseDate, project?.meta?.releaseDate);
+
+    // Self-contained manifest for third-party consumption
     const manifest = {
       version: 1,
       shareId,
-      projectId,
-      snapshotKey,
+      projectId: String(projectId),
+      snapshotKey: String(snapshotKey),
       publishedAt: new Date().toISOString(),
       album: {
-        title: project?.album?.title || "Album",
+        title: albumTitle,
+        ...(artist ? { artist } : {}),
+        ...(releaseDate ? { releaseDate } : {}),
         ...(coverUrl ? { coverUrl } : {}),
-        ...(totalAlbumTimeSec ? {
-          totalAlbumTimeSec,
-          totalAlbumTime: fmt(totalAlbumTimeSec),
-        } : {}),
+        ...(coverKey ? { coverKey } : {}),
       },
       tracks: publishedTracks,
       playback: {
         albumOrder: publishedTracks.map((t) => String(t.slot)),
+        smartBridge: {
+          mode: "graph",
+          entry: String(publishedTracks[0]?.slot || 1),
+          edges: [],
+        },
+      },
+      diagnostics: {
+        tracksFoundInSnapshot: tracks.length,
+        tracksPublished: publishedTracks.length,
+        coverPublished: !!coverUrl,
       },
     };
 
-    const manifestKey = `${base}/manifest.json`;
-    await put({
+    const manifestKey = `${baseKey}/manifest.json`;
+    const manifestStr = JSON.stringify(manifest, null, 2);
+
+    await putObject({
       key: manifestKey,
-      body: Buffer.from(JSON.stringify(manifest, null, 2)),
-      type: "application/json",
-      cache: "public, max-age=31536000, immutable",
+      body: Buffer.from(manifestStr),
+      contentType: "application/json; charset=utf-8",
+      cacheControl: "public, max-age=31536000, immutable",
+      contentLength: Buffer.byteLength(manifestStr),
     });
 
-    const indexKey = `${base}/index.html`;
-    await put({
+    // Optional debug index
+    const indexKey = `${baseKey}/index.html`;
+    const html = `<!doctype html>
+<html>
+<head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/><title>Published</title></head>
+<body><pre id="out">Loading…</pre>
+<script>
+fetch("./manifest.json").then(r=>r.json()).then(m=>{document.getElementById("out").textContent=JSON.stringify(m,null,2);})
+.catch(e=>{document.getElementById("out").textContent=String(e);});
+</script>
+</body></html>`;
+
+    await putObject({
       key: indexKey,
-      body: Buffer.from(`<pre>${JSON.stringify(manifest, null, 2)}</pre>`),
-      type: "text/html",
-      cache: "public, max-age=31536000, immutable",
+      body: Buffer.from(html),
+      contentType: "text/html; charset=utf-8",
+      cacheControl: "public, max-age=31536000, immutable",
+      contentLength: Buffer.byteLength(html),
     });
 
-    res.json({
-      ok: true,
-      shareId,
-      publicUrl: publicUrl(indexKey),
-      manifestKey,
-    });
+    const publicUrl = publicUrlForKey(indexKey);
+
+    return res.json({ ok: true, shareId, publicUrl, manifestKey });
   } catch (e) {
-    res.status(500).json({ ok: false, error: e.message });
+    console.error("publish-minisite error:", e);
+    return res.status(500).json({ ok: false, error: e?.message || String(e) });
+  }
+});
+
+// ---------- PUBLISHED MANIFEST (read back the published artifact) ----------
+app.get("/api/publish/:shareId/manifest", async (req, res) => {
+  try {
+    const shareId = String(req.params.shareId || "").trim();
+    if (!shareId) return res.status(400).json({ ok: false, error: "missing shareId" });
+
+    const key = `public/players/${shareId}/manifest.json`;
+    const manifest = await getObjectJson(key);
+
+    res.setHeader("Cache-Control", "no-store");
+    return res.json({ ok: true, ...manifest });
+  } catch (e) {
+    const msg = String(e?.name || "") === "NoSuchKey" ? "NO_SUCH_SHARE" : String(e?.message || e);
+    console.error("publish manifest error:", e);
+    return res.status(404).json({ ok: false, error: msg });
   }
 });
 
 // ---------- START ----------
-app.listen(PORT, () =>
-  console.log(`album-backend running on ${PORT}`)
-);
+app.listen(PORT, () => {
+  console.log(`album-backend listening on ${PORT}`);
+  console.log(`AWS_REGION=${AWS_REGION}`);
+  console.log(`S3_BUCKET=${S3_BUCKET || "(missing)"}`);
+  console.log(`PUBLIC_PLAYERS_BASE_URL=${PUBLIC_PLAYERS_BASE_URL || "(empty)"}`);
+});
