@@ -267,6 +267,64 @@ function extractMetaBySlot(project) {
   return Object.keys(out).length ? out : undefined;
 }
 
+/**
+ * Album meta extractor (ALBUM FIELDS ONLY)
+ * - explicitly avoids Meta page fields (project.meta.*)
+ * - best-effort mapping of common album field locations
+ */
+function extractAlbumMeta(project) {
+  const title = firstStr(
+    project?.album?.albumName,
+    project?.album?.title,
+    project?.albumName,
+    project?.albumTitle,
+    project?.title
+  );
+
+  const artist = firstStr(
+    project?.album?.artist,
+    project?.album?.performers,
+    project?.performers,
+    project?.artist
+  );
+
+  const releaseDate = firstStr(project?.album?.releaseDate, project?.releaseDate);
+
+  const label = firstStr(project?.album?.label, project?.label);
+  const genre = firstStr(project?.album?.genre, project?.genre);
+  const upc = firstStr(project?.album?.upc, project?.upc);
+  const copyright = firstStr(project?.album?.copyright, project?.copyright);
+
+  const out = {};
+  if (title) out.title = title;
+  if (artist) out.artist = artist;
+  if (releaseDate) out.releaseDate = releaseDate;
+  if (label) out.label = label;
+  if (genre) out.genre = genre;
+  if (upc) out.upc = upc;
+  if (copyright) out.copyright = copyright;
+
+  return out;
+}
+
+/**
+ * Compute total album duration in seconds from extracted track durations.
+ * Returns undefined if no durations are present.
+ */
+function computeTotalDurationSec(tracks) {
+  if (!Array.isArray(tracks) || tracks.length === 0) return undefined;
+  let sum = 0;
+  let any = false;
+  for (const t of tracks) {
+    const n = Number(t?.durationSec);
+    if (Number.isFinite(n) && n > 0) {
+      sum += n;
+      any = true;
+    }
+  }
+  return any ? sum : undefined;
+}
+
 function extractCoverKey(project) {
   return firstStr(
     project?.coverS3Key,
@@ -358,6 +416,7 @@ app.post("/api/master-save", async (req, res) => {
     const project = req.body?.project || req.body?.masterSave || req.body?.masterSave?.project || null;
     if (!projectId || !project) return res.status(400).json({ ok: false, error: "missing payload" });
 
+    // NOTE: snapshot is stored as-is (caller owns shape). Publish derives album meta + total time.
     const snapshotKey = `storage/projects/${projectId}/master_save_snapshots/${isoForKey()}.json`;
     await putObject({
       key: snapshotKey,
@@ -435,10 +494,13 @@ app.post("/api/publish-minisite", async (req, res) => {
     if (srcCoverKey) {
       const { buf, contentType } = await getObjectBuffer(srcCoverKey);
       const ext =
-        String(contentType || "").includes("png") ? "png" :
-        String(contentType || "").includes("webp") ? "webp" :
-        String(contentType || "").includes("jpeg") || String(contentType || "").includes("jpg") ? "jpg" :
-        "jpg";
+        String(contentType || "").includes("png")
+          ? "png"
+          : String(contentType || "").includes("webp")
+          ? "webp"
+          : String(contentType || "").includes("jpeg") || String(contentType || "").includes("jpg")
+          ? "jpg"
+          : "jpg";
 
       coverKey = `${baseKey}/cover/cover.${ext}`;
       await putObject({
@@ -487,25 +549,9 @@ app.post("/api/publish-minisite", async (req, res) => {
       });
     }
 
-    const albumTitle = firstStr(
-      project?.albumName,
-      project?.albumTitle,
-      project?.title,
-      project?.album?.albumName,
-      project?.album?.title,
-      "Album"
-    );
-
-    const artist = firstStr(
-      project?.performers,
-      project?.artist,
-      project?.album?.artist,
-      project?.album?.performers,
-      project?.meta?.performers,
-      project?.meta?.artist
-    );
-
-    const releaseDate = firstStr(project?.releaseDate, project?.album?.releaseDate, project?.meta?.releaseDate);
+    // ----- album meta + total time (NEW) -----
+    const albumMeta = extractAlbumMeta(project);
+    const totalDurationSec = computeTotalDurationSec(publishedTracks);
 
     // Self-contained manifest for third-party consumption
     const manifest = {
@@ -515,11 +561,16 @@ app.post("/api/publish-minisite", async (req, res) => {
       snapshotKey: String(snapshotKey),
       publishedAt: new Date().toISOString(),
       album: {
-        title: albumTitle,
-        ...(artist ? { artist } : {}),
-        ...(releaseDate ? { releaseDate } : {}),
+        title: albumMeta.title || "Album",
+        ...(albumMeta.artist ? { artist: albumMeta.artist } : {}),
+        ...(albumMeta.releaseDate ? { releaseDate: albumMeta.releaseDate } : {}),
+        ...(albumMeta.label ? { label: albumMeta.label } : {}),
+        ...(albumMeta.genre ? { genre: albumMeta.genre } : {}),
+        ...(albumMeta.upc ? { upc: albumMeta.upc } : {}),
+        ...(albumMeta.copyright ? { copyright: albumMeta.copyright } : {}),
         ...(coverUrl ? { coverUrl } : {}),
         ...(coverKey ? { coverKey } : {}),
+        ...(totalDurationSec ? { totalDurationSec } : {}),
       },
       tracks: publishedTracks,
       playback: {
@@ -534,6 +585,8 @@ app.post("/api/publish-minisite", async (req, res) => {
         tracksFoundInSnapshot: tracks.length,
         tracksPublished: publishedTracks.length,
         coverPublished: !!coverUrl,
+        albumMetaIncluded: Object.keys(albumMeta || {}).length > 0,
+        totalDurationSec: totalDurationSec || 0,
       },
     };
 
