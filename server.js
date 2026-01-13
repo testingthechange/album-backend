@@ -647,6 +647,41 @@ app.get("/api/publish/:shareId/manifest", async (req, res) => {
     return res.status(404).json({ ok: false, error: msg });
   }
 });
+// ---------- DEBUG: inspect album meta in a snapshot ----------
+app.get("/api/debug/snapshot-album/:projectId", async (req, res) => {
+  try {
+    const projectId = String(req.params.projectId || "").trim();
+    if (!projectId) return res.status(400).json({ ok: false, error: "missing projectId" });
+
+    const latestKey = `storage/projects/${projectId}/master_save_snapshots/latest.json`;
+    const latest = await getObjectJson(latestKey);
+
+    const snapshotKey = String(latest?.snapshotKey || "").trim();
+    if (!snapshotKey) return res.status(404).json({ ok: false, error: "NO_LATEST_SNAPSHOT_KEY", latestKey });
+
+    const project = await getObjectJson(snapshotKey);
+
+    res.setHeader("Cache-Control", "no-store");
+    return res.json({
+      ok: true,
+      projectId,
+      latestKey,
+      snapshotKey,
+      albumMeta: project?.album?.meta || null,
+      albumRoot: project?.album || null,
+      topLevel: {
+        albumName: project?.albumName || null,
+        albumTitle: project?.albumTitle || null,
+        title: project?.title || null,
+        artist: project?.artist || null,
+        performers: project?.performers || null,
+        releaseDate: project?.releaseDate || null,
+      },
+    });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
+});
 
 // ---------- START ----------
 app.listen(PORT, () => {
