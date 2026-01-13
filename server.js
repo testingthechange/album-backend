@@ -127,13 +127,17 @@ function firstNum(...vals) {
 
 /**
  * Extract tracks from snapshot and ONLY return tracks that actually have audio (s3Key).
+ *
+ * IMPORTANT: supports the catalog snapshot shape:
+ *   project.catalog.songs[].files.album.s3Key
  */
 function extractTracksFromSnapshot(project) {
   if (!project || typeof project !== "object") return [];
 
-  // Prefer masterSaveMiniSite shape if present
+  // Candidates in priority order
   const candidates = [
-    project?.audio?.mp3, // from masterSaveMiniSite
+    project?.audio?.mp3, // masterSaveMiniSite audio list (if present)
+    project?.catalog?.songs, // catalog-driven snapshot (your current shape)
     project?.tracks,
     project?.catalog?.tracks,
     project?.catalog?.songs,
@@ -157,12 +161,20 @@ function extractTracksFromSnapshot(project) {
   if (!Array.isArray(arr)) return [];
 
   const normalized = arr.map((t, i) => {
-    // masterSaveMiniSite audio.mp3 entries use trackId + s3Key
     const slot = Number(t?.slot ?? t?.trackNumber ?? t?.index ?? i + 1) || i + 1;
 
     const title =
-      firstStr(t?.title, t?.name, t?.songTitle, t?.trackTitle, t?.meta?.title, t?.albumTitle) || "Untitled";
+      firstStr(
+        t?.titleJson?.title,
+        t?.title,
+        t?.name,
+        t?.songTitle,
+        t?.trackTitle,
+        t?.meta?.title,
+        t?.albumTitle
+      ) || "Untitled";
 
+    // ✅ FIX: include catalog shape: files.album.s3Key
     const s3Key = firstStr(
       t?.s3Key,
       t?.audioS3Key,
@@ -173,7 +185,15 @@ function extractTracksFromSnapshot(project) {
       t?.asset?.s3Key,
       t?.audio?.key,
       t?.mp3?.s3Key,
-      t?.catalogAudioS3Key
+      t?.catalogAudioS3Key,
+
+      // catalog files (album / A / B)
+      t?.files?.album?.s3Key,
+      t?.files?.album?.key,
+      t?.files?.a?.s3Key,
+      t?.files?.a?.key,
+      t?.files?.b?.s3Key,
+      t?.files?.b?.key
     );
 
     const durationSec = firstNum(t?.durationSec, t?.duration, t?.audio?.durationSec, t?.meta?.durationSec);
@@ -266,13 +286,9 @@ app.get("/api/playback-url", async (req, res) => {
 // ---------- MASTER SAVE (writes snapshot + latest pointer) ----------
 app.post("/api/master-save", async (req, res) => {
   try {
-    // ✅ accept both new + legacy caller shapes
+    // accept both new + legacy caller shapes
     const projectId = String(req.body?.projectId || "").trim();
-    const project =
-      req.body?.project ||
-      req.body?.masterSave ||
-      req.body?.masterSave?.project ||
-      null;
+    const project = req.body?.project || req.body?.masterSave || req.body?.masterSave?.project || null;
 
     if (!projectId || !project) return res.status(400).json({ ok: false, error: "missing payload" });
 
@@ -294,8 +310,7 @@ app.post("/api/master-save", async (req, res) => {
       ok: true,
       snapshotKey,
       latestKey,
-      // legacy alias so old callers that expect s3Key keep working
-      s3Key: snapshotKey,
+      s3Key: snapshotKey, // legacy alias
     });
   } catch (e) {
     console.error("master-save error:", e);
@@ -327,7 +342,6 @@ app.get("/api/master-save/latest/:projectId", async (req, res) => {
       ok: true,
       latestKey,
       latest,
-      // ✅ add top-level convenience keys for UI code
       latestSnapshotKey: snapshotKey,
       latestSnapshot: { snapshotKey, savedAt: String(latest?.savedAt || "") },
       snapshot: { projectId, savedAt: String(latest?.savedAt || ""), project },
@@ -347,14 +361,14 @@ app.post("/api/publish-minisite", async (req, res) => {
       return res.status(400).json({ ok: false, error: "projectId and snapshotKey are required" });
     }
 
-    // 1) load snapshot (AlbumBundle source of truth)
+    // 1) load snapshot
     const project = await getObjectJson(String(snapshotKey).trim());
 
-    // 2) generate shareId + base publish prefix
+    // 2) shareId + base publish prefix
     const shareId = crypto.randomBytes(8).toString("hex");
     const baseKey = `public/players/${shareId}`;
 
-    // 3) extract audio-backed tracks from snapshot
+    // 3) extract audio-backed tracks (NOW supports catalog files.album.s3Key)
     const tracks = extractTracksFromSnapshot(project);
 
     // 4) copy audio into public publish area + build track urls
@@ -373,7 +387,6 @@ app.post("/api/publish-minisite", async (req, res) => {
         key: dstKey,
         body: obj.Body, // stream
         contentType: "audio/mpeg",
-        // publish artifacts should be cacheable (immutable path)
         cacheControl: "public, max-age=31536000, immutable",
       });
 
@@ -387,26 +400,25 @@ app.post("/api/publish-minisite", async (req, res) => {
       });
     }
 
-    // 5) hard-handoff manifest (self-contained; no backend required after publish)
+    // 5) manifest (self-contained)
     const manifest = {
       version: 1,
       shareId,
       projectId: String(projectId),
       snapshotKey: String(snapshotKey),
       publishedAt: new Date().toISOString(),
-
-      // minimal album surface (extend later if needed)
       album: {
         title: firstStr(project?.albumName, project?.albumTitle, project?.title, "Album"),
         artist: firstStr(project?.performers, project?.artist, project?.album?.artist, "") || undefined,
       },
-
       tracks: publishedTracks,
-
-      // placeholder smart bridge plan (data-only; computed at publish when ready)
       playback: {
         albumOrder: publishedTracks.map((t) => t.trackId || String(t.slot)),
-        smartBridge: { mode: "graph", entry: publishedTracks[0]?.trackId || String(publishedTracks[0]?.slot || 1), edges: [] },
+        smartBridge: {
+          mode: "graph",
+          entry: publishedTracks[0]?.trackId || String(publishedTracks[0]?.slot || 1),
+          edges: [],
+        },
       },
     };
 
@@ -445,7 +457,7 @@ fetch("./manifest.json").then(r=>r.json()).then(m=>{document.getElementById("out
   }
 });
 
-// ---------- PUBLISHED MANIFEST (now returns the published manifest directly) ----------
+// ---------- PUBLISHED MANIFEST (returns the published manifest directly) ----------
 app.get("/api/publish/:shareId/manifest", async (req, res) => {
   try {
     const shareId = String(req.params.shareId || "").trim();
