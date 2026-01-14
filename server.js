@@ -267,64 +267,6 @@ function extractMetaBySlot(project) {
   return Object.keys(out).length ? out : undefined;
 }
 
-/**
- * Album meta extractor (ALBUM FIELDS ONLY)
- * - explicitly avoids Meta page fields (project.meta.*)
- * - best-effort mapping of common album field locations
- */
-function extractAlbumMeta(project) {
-  const title = firstStr(
-    project?.album?.albumName,
-    project?.album?.title,
-    project?.albumName,
-    project?.albumTitle,
-    project?.title
-  );
-
-  const artist = firstStr(
-    project?.album?.artist,
-    project?.album?.performers,
-    project?.performers,
-    project?.artist
-  );
-
-  const releaseDate = firstStr(project?.album?.releaseDate, project?.releaseDate);
-
-  const label = firstStr(project?.album?.label, project?.label);
-  const genre = firstStr(project?.album?.genre, project?.genre);
-  const upc = firstStr(project?.album?.upc, project?.upc);
-  const copyright = firstStr(project?.album?.copyright, project?.copyright);
-
-  const out = {};
-  if (title) out.title = title;
-  if (artist) out.artist = artist;
-  if (releaseDate) out.releaseDate = releaseDate;
-  if (label) out.label = label;
-  if (genre) out.genre = genre;
-  if (upc) out.upc = upc;
-  if (copyright) out.copyright = copyright;
-
-  return out;
-}
-
-/**
- * Compute total album duration in seconds from extracted track durations.
- * Returns undefined if no durations are present.
- */
-function computeTotalDurationSec(tracks) {
-  if (!Array.isArray(tracks) || tracks.length === 0) return undefined;
-  let sum = 0;
-  let any = false;
-  for (const t of tracks) {
-    const n = Number(t?.durationSec);
-    if (Number.isFinite(n) && n > 0) {
-      sum += n;
-      any = true;
-    }
-  }
-  return any ? sum : undefined;
-}
-
 function extractCoverKey(project) {
   return firstStr(
     project?.coverS3Key,
@@ -416,7 +358,6 @@ app.post("/api/master-save", async (req, res) => {
     const project = req.body?.project || req.body?.masterSave || req.body?.masterSave?.project || null;
     if (!projectId || !project) return res.status(400).json({ ok: false, error: "missing payload" });
 
-    // NOTE: snapshot is stored as-is (caller owns shape). Publish derives album meta + total time.
     const snapshotKey = `storage/projects/${projectId}/master_save_snapshots/${isoForKey()}.json`;
     await putObject({
       key: snapshotKey,
@@ -473,6 +414,42 @@ app.get("/api/master-save/latest/:projectId", async (req, res) => {
   }
 });
 
+// ---------- DEBUG: inspect album meta in a snapshot ----------
+app.get("/api/debug/snapshot-album/:projectId", async (req, res) => {
+  try {
+    const projectId = String(req.params.projectId || "").trim();
+    if (!projectId) return res.status(400).json({ ok: false, error: "missing projectId" });
+
+    const latestKey = `storage/projects/${projectId}/master_save_snapshots/latest.json`;
+    const latest = await getObjectJson(latestKey);
+
+    const snapshotKey = String(latest?.snapshotKey || "").trim();
+    if (!snapshotKey) return res.status(404).json({ ok: false, error: "NO_LATEST_SNAPSHOT_KEY", latestKey });
+
+    const project = await getObjectJson(snapshotKey);
+
+    res.setHeader("Cache-Control", "no-store");
+    return res.json({
+      ok: true,
+      projectId,
+      latestKey,
+      snapshotKey,
+      albumMeta: project?.album?.meta || null,
+      albumRoot: project?.album || null,
+      topLevel: {
+        albumName: project?.albumName || null,
+        albumTitle: project?.albumTitle || null,
+        title: project?.title || null,
+        artist: project?.artist || null,
+        performers: project?.performers || null,
+        releaseDate: project?.releaseDate || null,
+      },
+    });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
+});
+
 // ---------- PUBLISH MINISITE (HARD HANDOFF: manifest + public audio + public cover) ----------
 app.post("/api/publish-minisite", async (req, res) => {
   try {
@@ -494,13 +471,10 @@ app.post("/api/publish-minisite", async (req, res) => {
     if (srcCoverKey) {
       const { buf, contentType } = await getObjectBuffer(srcCoverKey);
       const ext =
-        String(contentType || "").includes("png")
-          ? "png"
-          : String(contentType || "").includes("webp")
-          ? "webp"
-          : String(contentType || "").includes("jpeg") || String(contentType || "").includes("jpg")
-          ? "jpg"
-          : "jpg";
+        String(contentType || "").includes("png") ? "png" :
+        String(contentType || "").includes("webp") ? "webp" :
+        String(contentType || "").includes("jpeg") || String(contentType || "").includes("jpg") ? "jpg" :
+        "jpg";
 
       coverKey = `${baseKey}/cover/cover.${ext}`;
       await putObject({
@@ -549,9 +523,43 @@ app.post("/api/publish-minisite", async (req, res) => {
       });
     }
 
-    // ----- album meta + total time (NEW) -----
-    const albumMeta = extractAlbumMeta(project);
-    const totalDurationSec = computeTotalDurationSec(publishedTracks);
+    // ✅ FIX: album meta should come from Album page fields: project.album.meta.*
+    const albumTitle = firstStr(
+      project?.album?.meta?.albumTitle,
+      project?.album?.meta?.title,
+      project?.album?.albumName,
+      project?.album?.title,
+      project?.albumName,
+      project?.albumTitle,
+      project?.title,
+      "Album"
+    );
+
+    const artist = firstStr(
+      project?.album?.meta?.artistName,
+      project?.album?.meta?.artist,
+      project?.album?.artist,
+      project?.artist,
+      project?.performers,
+      project?.album?.performers,
+      project?.meta?.performers,
+      project?.meta?.artist
+    );
+
+    const releaseDate = firstStr(
+      project?.album?.meta?.releaseDate,
+      project?.album?.releaseDate,
+      project?.releaseDate,
+      project?.meta?.releaseDate
+    );
+
+    const albumMetaIncluded = !!firstStr(
+      project?.album?.meta?.albumTitle,
+      project?.album?.meta?.artistName,
+      project?.album?.meta?.releaseDate
+    );
+
+    const totalDurationSec = publishedTracks.reduce((sum, t) => sum + (Number(t?.durationSec || 0) || 0), 0);
 
     // Self-contained manifest for third-party consumption
     const manifest = {
@@ -561,16 +569,11 @@ app.post("/api/publish-minisite", async (req, res) => {
       snapshotKey: String(snapshotKey),
       publishedAt: new Date().toISOString(),
       album: {
-        title: albumMeta.title || "Album",
-        ...(albumMeta.artist ? { artist: albumMeta.artist } : {}),
-        ...(albumMeta.releaseDate ? { releaseDate: albumMeta.releaseDate } : {}),
-        ...(albumMeta.label ? { label: albumMeta.label } : {}),
-        ...(albumMeta.genre ? { genre: albumMeta.genre } : {}),
-        ...(albumMeta.upc ? { upc: albumMeta.upc } : {}),
-        ...(albumMeta.copyright ? { copyright: albumMeta.copyright } : {}),
+        title: albumTitle,
+        ...(artist ? { artist } : {}),
+        ...(releaseDate ? { releaseDate } : {}),
         ...(coverUrl ? { coverUrl } : {}),
         ...(coverKey ? { coverKey } : {}),
-        ...(totalDurationSec ? { totalDurationSec } : {}),
       },
       tracks: publishedTracks,
       playback: {
@@ -585,8 +588,8 @@ app.post("/api/publish-minisite", async (req, res) => {
         tracksFoundInSnapshot: tracks.length,
         tracksPublished: publishedTracks.length,
         coverPublished: !!coverUrl,
-        albumMetaIncluded: Object.keys(albumMeta || {}).length > 0,
-        totalDurationSec: totalDurationSec || 0,
+        albumMetaIncluded,
+        totalDurationSec,
       },
     };
 
@@ -645,41 +648,6 @@ app.get("/api/publish/:shareId/manifest", async (req, res) => {
     const msg = String(e?.name || "") === "NoSuchKey" ? "NO_SUCH_SHARE" : String(e?.message || e);
     console.error("publish manifest error:", e);
     return res.status(404).json({ ok: false, error: msg });
-  }
-});
-// ---------- DEBUG: inspect album meta in a snapshot ----------
-app.get("/api/debug/snapshot-album/:projectId", async (req, res) => {
-  try {
-    const projectId = String(req.params.projectId || "").trim();
-    if (!projectId) return res.status(400).json({ ok: false, error: "missing projectId" });
-
-    const latestKey = `storage/projects/${projectId}/master_save_snapshots/latest.json`;
-    const latest = await getObjectJson(latestKey);
-
-    const snapshotKey = String(latest?.snapshotKey || "").trim();
-    if (!snapshotKey) return res.status(404).json({ ok: false, error: "NO_LATEST_SNAPSHOT_KEY", latestKey });
-
-    const project = await getObjectJson(snapshotKey);
-
-    res.setHeader("Cache-Control", "no-store");
-    return res.json({
-      ok: true,
-      projectId,
-      latestKey,
-      snapshotKey,
-      albumMeta: project?.album?.meta || null,
-      albumRoot: project?.album || null,
-      topLevel: {
-        albumName: project?.albumName || null,
-        albumTitle: project?.albumTitle || null,
-        title: project?.title || null,
-        artist: project?.artist || null,
-        performers: project?.performers || null,
-        releaseDate: project?.releaseDate || null,
-      },
-    });
-  } catch (e) {
-    return res.status(500).json({ ok: false, error: String(e?.message || e) });
   }
 });
 
