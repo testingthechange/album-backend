@@ -338,4 +338,9 @@ const manifests = {
         id: "t3",
         title: "Track 3",
         duration: "4:01",
-        previewUrl: "https://album-backend-kmuo.onrender.com/media/track3-preview.mp3"
+        previewUrl: "https://album-backend-kmuo.onrender.com/media/track3-preview.mp3",
+      },
+    ],
+  },
+};
+
