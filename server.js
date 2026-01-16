@@ -4,7 +4,12 @@ import cors from "cors";
 import multer from "multer";
 import crypto from "crypto";
 
-import { S3Client, PutObjectCommand, GetObjectCommand, HeadObjectCommand } from "@aws-sdk/client-s3";
+import {
+  S3Client,
+  PutObjectCommand,
+  GetObjectCommand,
+  HeadObjectCommand,
+} from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 
 const app = express();
@@ -12,6 +17,7 @@ app.set("trust proxy", 1);
 
 const upload = multer({ storage: multer.memoryStorage() });
 
+// ---- env ----
 const {
   AWS_ACCESS_KEY_ID,
   AWS_SECRET_ACCESS_KEY,
@@ -19,19 +25,22 @@ const {
   S3_BUCKET,
 } = process.env;
 
-const REQUIRED = ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_REGION", "S3_BUCKET"];
+const REQUIRED = ["AWS_REGION", "S3_BUCKET"];
 for (const k of REQUIRED) {
-  if (!process.env[k]) {
-    console.error(`Missing required env var: ${k}`);
-  }
+  if (!process.env[k]) console.error(`Missing required env var: ${k}`);
 }
 
 const s3 = new S3Client({
   region: AWS_REGION,
-  credentials: AWS_ACCESS_KEY_ID && AWS_SECRET_ACCESS_KEY ? {
-    accessKeyId: AWS_ACCESS_KEY_ID,
-    secretAccessKey: AWS_SECRET_ACCESS_KEY,
-  } : undefined,
+  // If running on Render with an IAM role, credentials can be omitted.
+  // If you are using explicit keys, keep them here.
+  credentials:
+    AWS_ACCESS_KEY_ID && AWS_SECRET_ACCESS_KEY
+      ? {
+          accessKeyId: AWS_ACCESS_KEY_ID,
+          secretAccessKey: AWS_SECRET_ACCESS_KEY,
+        }
+      : undefined,
 });
 
 const ALLOWED_ORIGINS = [
@@ -53,9 +62,11 @@ app.use(
   })
 );
 
+// IMPORTANT: preflight must use the same CORS config
 app.options("*", cors());
 app.use(express.json());
 
+// ---- helpers ----
 function isoStamp() {
   return new Date().toISOString().replace(/[:.]/g, "-");
 }
@@ -68,9 +79,10 @@ function safeFileName(name) {
 }
 function guessContentType(file) {
   const mt = String(file?.mimetype || "").toLowerCase();
-  if (mt) return mt;
-  // fallback for common audio uploads
-  return "audio/mpeg";
+  return mt || "audio/mpeg";
+}
+function isHttpUrl(s) {
+  return /^https?:\/\//i.test(String(s || ""));
 }
 
 // ---- health ----
@@ -90,10 +102,9 @@ app.post("/api/upload-to-s3", upload.single("file"), async (req, res) => {
     const file = req.file;
     if (!file?.buffer) return res.status(400).json({ ok: false, error: "NO_FILE" });
 
-    // The frontend sends s3Key; we MUST honor it so playback-url matches.
+    // MUST honor frontend-provided s3Key (so playback-url matches)
     let s3Key = String(req.body?.s3Key || "").trim();
 
-    // If missing, generate a deterministic-ish key under the same storage path pattern
     if (!s3Key) {
       const fn = safeFileName(file.originalname || "audio.mp3");
       s3Key = `storage/projects/${projectId}/catalog/uploads/${isoStamp()}__${fn}`;
@@ -107,7 +118,6 @@ app.post("/api/upload-to-s3", upload.single("file"), async (req, res) => {
         Key: s3Key,
         Body: file.buffer,
         ContentType: contentType,
-        // optional: better behavior for streaming/mp3
         CacheControl: "no-store",
       })
     );
@@ -127,13 +137,13 @@ app.get("/api/playback-url", async (req, res) => {
     const s3Key = String(req.query?.s3Key || "").trim();
     if (!s3Key) return res.status(400).json({ ok: false, error: "MISSING_S3KEY" });
 
-    // if already a URL, return it (lets you keep demo URLs)
-    if (/^https?:\/\//i.test(s3Key)) return res.json({ ok: true, url: s3Key });
+    // allow demo URLs
+    if (isHttpUrl(s3Key)) return res.json({ ok: true, url: s3Key });
 
-    // Confirm object exists (gives cleaner error than signing a missing key)
+    // confirm exists
     try {
       await s3.send(new HeadObjectCommand({ Bucket: S3_BUCKET, Key: s3Key }));
-    } catch {
+    } catch (e) {
       return res.status(404).json({ ok: false, error: "UPLOAD_NOT_FOUND_FOR_S3KEY", s3Key });
     }
 
@@ -158,7 +168,9 @@ app.post("/api/master-save", async (req, res) => {
   try {
     const { projectId, project } = req.body || {};
     const pid = String(projectId || "").trim();
-    if (!pid || !project) return res.status(400).json({ ok: false, error: "Missing projectId or project" });
+    if (!pid || !project) {
+      return res.status(400).json({ ok: false, error: "Missing projectId or project" });
+    }
 
     const now = new Date().toISOString();
     const ts = isoStamp();
@@ -167,22 +179,13 @@ app.post("/api/master-save", async (req, res) => {
     const latestKey = `storage/projects/${pid}/producer_returns/latest.json`;
 
     const snapshotBody = JSON.stringify(
-      {
-        projectId: pid,
-        createdAt: now,
-        source: "minisite-master-save",
-        data: project,
-      },
+      { projectId: pid, createdAt: now, source: "minisite-master-save", data: project },
       null,
       2
     );
 
     const latestBody = JSON.stringify(
-      {
-        projectId: pid,
-        latestSnapshotKey: snapshotKey,
-        lastMasterSaveAt: now,
-      },
+      { projectId: pid, latestSnapshotKey: snapshotKey, lastMasterSaveAt: now },
       null,
       2
     );
@@ -214,14 +217,83 @@ app.post("/api/master-save", async (req, res) => {
   }
 });
 
+// ---- master-save latest (S3 JSON) ----
+// GET /api/master-save/latest/:projectId
+app.get("/api/master-save/latest/:projectId", async (req, res) => {
+  try {
+    const pid = String(req.params.projectId || "").trim();
+    if (!pid) return res.status(400).json({ ok: false, error: "MISSING_PROJECT_ID" });
+
+    const latestKey = `storage/projects/${pid}/producer_returns/latest.json`;
+
+    // fetch latest.json
+    let latestJson;
+    try {
+      const url = await getSignedUrl(
+        s3,
+        new GetObjectCommand({ Bucket: S3_BUCKET, Key: latestKey }),
+        { expiresIn: 60 }
+      );
+      const r = await fetch(url);
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      latestJson = await r.json();
+    } catch (e) {
+      return res.status(404).json({ ok: false, error: "NO_LATEST", latestKey });
+    }
+
+    const snapKey =
+      String(latestJson?.latestSnapshotKey || "").trim() ||
+      String(latestJson?.snapshotKey || "").trim();
+
+    if (!snapKey) {
+      return res.status(404).json({ ok: false, error: "NO_LATEST_SNAPSHOT_KEY", latestKey });
+    }
+
+    // fetch snapshot
+    let snapshotJson;
+    try {
+      const url = await getSignedUrl(
+        s3,
+        new GetObjectCommand({ Bucket: S3_BUCKET, Key: snapKey }),
+        { expiresIn: 60 }
+      );
+      const r = await fetch(url);
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      snapshotJson = await r.json();
+    } catch (e) {
+      return res.status(404).json({ ok: false, error: "SNAPSHOT_NOT_FOUND", snapshotKey: snapKey });
+    }
+
+    return res.json({ ok: true, latestKey, latest: latestJson, snapshot: snapshotJson });
+  } catch (err) {
+    console.error("master-save latest error", err);
+    return res.status(500).json({ ok: false, error: String(err?.message || err) });
+  }
+});
+
 // ---- publish demo manifest (unchanged) ----
 const manifests = {
   demo: {
     albumTitle: "Demo Album",
     tracks: [
-      { id: "t1", title: "Track 1", duration: "3:12", previewUrl: "https://album-backend-kmuo.onrender.com/media/track1-preview.mp3" },
-      { id: "t2", title: "Track 2", duration: "2:58", previewUrl: "https://album-backend-kmuo.onrender.com/media/track2-preview.mp3" },
-      { id: "t3", title: "Track 3", duration: "4:01", previewUrl: "https://album-backend-kmuo.onrender.com/media/track3-preview.mp3" },
+      {
+        id: "t1",
+        title: "Track 1",
+        duration: "3:12",
+        previewUrl: "https://album-backend-kmuo.onrender.com/media/track1-preview.mp3",
+      },
+      {
+        id: "t2",
+        title: "Track 2",
+        duration: "2:58",
+        previewUrl: "https://album-backend-kmuo.onrender.com/media/track2-preview.mp3",
+      },
+      {
+        id: "t3",
+        title: "Track 3",
+        duration: "4:01",
+        previewUrl: "https://album-backend-kmuo.onrender.com/media/track3-preview.mp3",
+      },
     ],
   },
 };
