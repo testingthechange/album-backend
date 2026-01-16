@@ -94,6 +94,18 @@ function isHttpUrl(s) {
   return /^https?:\/\//i.test(String(s || ""));
 }
 
+// Fetch JSON from S3 via short-lived presigned URL (bucket can remain private)
+async function getJsonFromS3(key) {
+  const url = await getSignedUrl(
+    s3,
+    new GetObjectCommand({ Bucket: S3_BUCKET, Key: key }),
+    { expiresIn: 60 }
+  );
+  const r = await fetch(url);
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  return await r.json();
+}
+
 // ---- health ----
 app.get("/api/health", (_req, res) => {
   res.json({ ok: true, service: "album-backend" });
@@ -286,14 +298,7 @@ app.get("/api/master-save/latest/:projectId", async (req, res) => {
     // fetch latest.json
     let latestJson;
     try {
-      const url = await getSignedUrl(
-        s3,
-        new GetObjectCommand({ Bucket: S3_BUCKET, Key: latestKey }),
-        { expiresIn: 60 }
-      );
-      const r = await fetch(url);
-      if (!r.ok) throw new Error(`HTTP ${r.status}`);
-      latestJson = await r.json();
+      latestJson = await getJsonFromS3(latestKey);
     } catch (_e) {
       return res.status(404).json({ ok: false, error: "NO_LATEST", latestKey });
     }
@@ -311,14 +316,7 @@ app.get("/api/master-save/latest/:projectId", async (req, res) => {
     // fetch snapshot
     let snapshotJson;
     try {
-      const url = await getSignedUrl(
-        s3,
-        new GetObjectCommand({ Bucket: S3_BUCKET, Key: snapKey }),
-        { expiresIn: 60 }
-      );
-      const r = await fetch(url);
-      if (!r.ok) throw new Error(`HTTP ${r.status}`);
-      snapshotJson = await r.json();
+      snapshotJson = await getJsonFromS3(snapKey);
     } catch (_e) {
       return res
         .status(404)
@@ -347,14 +345,7 @@ app.post("/api/publish-minisite", async (req, res) => {
     // fetch latest.json
     let latestJson;
     try {
-      const url = await getSignedUrl(
-        s3,
-        new GetObjectCommand({ Bucket: S3_BUCKET, Key: latestKey }),
-        { expiresIn: 60 }
-      );
-      const r = await fetch(url);
-      if (!r.ok) throw new Error(`HTTP ${r.status}`);
-      latestJson = await r.json();
+      latestJson = await getJsonFromS3(latestKey);
     } catch (_e) {
       return res.status(404).json({ ok: false, error: "NO_LATEST_MASTER_SAVE", latestKey });
     }
@@ -370,14 +361,7 @@ app.post("/api/publish-minisite", async (req, res) => {
     // fetch snapshot
     let snapshotJson;
     try {
-      const url = await getSignedUrl(
-        s3,
-        new GetObjectCommand({ Bucket: S3_BUCKET, Key: snapshotKey }),
-        { expiresIn: 60 }
-      );
-      const r = await fetch(url);
-      if (!r.ok) throw new Error(`HTTP ${r.status}`);
-      snapshotJson = await r.json();
+      snapshotJson = await getJsonFromS3(snapshotKey);
     } catch (_e) {
       return res.status(404).json({ ok: false, error: "SNAPSHOT_NOT_FOUND", snapshotKey });
     }
@@ -417,16 +401,60 @@ app.post("/api/publish-minisite", async (req, res) => {
       })
     );
 
-    // Return a signed URL for the manifest (works even if bucket is private)
-    const publicUrl = await getSignedUrl(
-      s3,
-      new GetObjectCommand({ Bucket: S3_BUCKET, Key: manifestKey }),
-      { expiresIn: 60 * 60 } // 1 hour
-    );
+    // ✅ Stable "public" URL served by the backend (no S3 public access needed)
+    const publicUrl = `${req.protocol}://${req.get("host")}/publish/${shareId}.json`;
 
     return res.json({ ok: true, shareId, manifestKey, publicUrl, snapshotKey });
   } catch (err) {
     console.error("publish-minisite error", err);
+    return res.status(500).json({ ok: false, error: String(err?.message || err) });
+  }
+});
+
+// ---- publish manifest (served by backend; re-signs tracks on demand) ----
+// GET /publish/:shareId.json
+app.get("/publish/:shareId.json", async (req, res) => {
+  try {
+    const shareId = String(req.params.shareId || "").trim();
+    if (!shareId) return res.status(400).json({ ok: false, error: "MISSING_SHARE_ID" });
+
+    const manifestKey = `public/players/${shareId}/manifest.json`;
+
+    let manifest;
+    try {
+      manifest = await getJsonFromS3(manifestKey);
+    } catch (_e) {
+      return res.status(404).json({ ok: false, error: "MANIFEST_NOT_FOUND", shareId, manifestKey });
+    }
+
+    const tracks = Array.isArray(manifest?.tracks) ? manifest.tracks : [];
+
+    const signedTracks = await Promise.all(
+      tracks.map(async (t) => {
+        const s3Key = String(t?.s3Key || "").trim();
+        const playbackUrl = String(t?.playbackUrl || "").trim();
+
+        if (s3Key) {
+          const freshUrl = await getSignedUrl(
+            s3,
+            new GetObjectCommand({ Bucket: S3_BUCKET, Key: s3Key }),
+            { expiresIn: 60 * 20 } // 20 minutes
+          );
+          return { ...t, playbackUrl: freshUrl };
+        }
+
+        if (isHttpUrl(playbackUrl)) return t;
+
+        return t;
+      })
+    );
+
+    const out = { ...manifest, tracks: signedTracks };
+
+    res.setHeader("Cache-Control", "no-store");
+    return res.json(out);
+  } catch (err) {
+    console.error("publish serve error", err);
     return res.status(500).json({ ok: false, error: String(err?.message || err) });
   }
 });
