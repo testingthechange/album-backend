@@ -90,10 +90,22 @@ app.get("/api/health", (_req, res) => {
   res.json({ ok: true, service: "album-backend" });
 });
 
+// ---- debug (TEMP) ----
+// Useful to confirm Render env + bucket/region are what you think.
+// Remove after diagnosis.
+app.get("/api/debug/s3", (_req, res) => {
+  res.json({
+    ok: true,
+    region: AWS_REGION || null,
+    bucket: S3_BUCKET || null,
+    hasExplicitKeys: Boolean(AWS_ACCESS_KEY_ID && AWS_SECRET_ACCESS_KEY),
+  });
+});
+
 // ---- upload-to-s3 (REAL S3) ----
 // POST /api/upload-to-s3?projectId=...
 // multipart form-data: file, s3Key
-// Returns: { ok:true, s3Key }
+// Returns: { ok:true, s3Key, url }
 app.post("/api/upload-to-s3", upload.single("file"), async (req, res) => {
   try {
     const projectId = String(req.query?.projectId || "").trim();
@@ -122,7 +134,15 @@ app.post("/api/upload-to-s3", upload.single("file"), async (req, res) => {
       })
     );
 
-    return res.json({ ok: true, s3Key });
+    // Convenience: return a signed URL immediately so the client can play without
+    // needing a second round-trip.
+    const url = await getSignedUrl(
+      s3,
+      new GetObjectCommand({ Bucket: S3_BUCKET, Key: s3Key }),
+      { expiresIn: 60 * 20 } // 20 minutes
+    );
+
+    return res.json({ ok: true, s3Key, url });
   } catch (err) {
     console.error("upload-to-s3 error", err);
     return res.status(500).json({ ok: false, error: String(err?.message || err) });
@@ -144,7 +164,33 @@ app.get("/api/playback-url", async (req, res) => {
     try {
       await s3.send(new HeadObjectCommand({ Bucket: S3_BUCKET, Key: s3Key }));
     } catch (e) {
-      return res.status(404).json({ ok: false, error: "UPLOAD_NOT_FOUND_FOR_S3KEY", s3Key });
+      const name = String(e?.name || "");
+      const http = e?.$metadata?.httpStatusCode;
+
+      // If perms are broken, do NOT report "not found" (it hides the real issue).
+      if (name === "AccessDenied" || http === 403) {
+        return res.status(403).json({
+          ok: false,
+          error: "S3_ACCESS_DENIED",
+          s3Key,
+          aws: {
+            name,
+            httpStatusCode: http,
+            message: String(e?.message || ""),
+          },
+        });
+      }
+
+      return res.status(404).json({
+        ok: false,
+        error: "UPLOAD_NOT_FOUND_FOR_S3KEY",
+        s3Key,
+        aws: {
+          name,
+          httpStatusCode: http,
+          message: String(e?.message || ""),
+        },
+      });
     }
 
     const url = await getSignedUrl(
@@ -292,24 +338,4 @@ const manifests = {
         id: "t3",
         title: "Track 3",
         duration: "4:01",
-        previewUrl: "https://album-backend-kmuo.onrender.com/media/track3-preview.mp3",
-      },
-    ],
-  },
-};
-
-app.get("/publish", (_req, res) => res.json({ shareIds: Object.keys(manifests) }));
-
-app.get("/publish/:shareId.json", (req, res) => {
-  const manifest = manifests[req.params.shareId];
-  if (!manifest) return res.status(404).json({ error: "not_found", shareId: req.params.shareId });
-  return res.json({ shareId: req.params.shareId, ...manifest });
-});
-
-// root
-app.get("/", (_req, res) => {
-  res.type("text").send("album-backend OK. Try /api/health or /publish/demo.json");
-});
-
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`album-backend listening on ${PORT}`));
+        previewUrl: "https://album-backend-kmuo.onrender.com/media/track3-preview.mp3"
