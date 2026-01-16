@@ -332,6 +332,105 @@ app.get("/api/master-save/latest/:projectId", async (req, res) => {
   }
 });
 
+// ---- publish minisite (S3 JSON manifest) ----
+// POST /api/publish-minisite
+// Body: { projectId: string }
+// Returns: { ok:true, shareId, manifestKey, publicUrl, snapshotKey }
+app.post("/api/publish-minisite", async (req, res) => {
+  try {
+    const { projectId } = req.body || {};
+    const pid = String(projectId || "").trim();
+    if (!pid) return res.status(400).json({ ok: false, error: "MISSING_PROJECT_ID" });
+
+    const latestKey = `storage/projects/${pid}/producer_returns/latest.json`;
+
+    // fetch latest.json
+    let latestJson;
+    try {
+      const url = await getSignedUrl(
+        s3,
+        new GetObjectCommand({ Bucket: S3_BUCKET, Key: latestKey }),
+        { expiresIn: 60 }
+      );
+      const r = await fetch(url);
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      latestJson = await r.json();
+    } catch (_e) {
+      return res.status(404).json({ ok: false, error: "NO_LATEST_MASTER_SAVE", latestKey });
+    }
+
+    const snapshotKey =
+      String(latestJson?.latestSnapshotKey || "").trim() ||
+      String(latestJson?.snapshotKey || "").trim();
+
+    if (!snapshotKey) {
+      return res.status(404).json({ ok: false, error: "NO_SNAPSHOT_KEY", latestKey });
+    }
+
+    // fetch snapshot
+    let snapshotJson;
+    try {
+      const url = await getSignedUrl(
+        s3,
+        new GetObjectCommand({ Bucket: S3_BUCKET, Key: snapshotKey }),
+        { expiresIn: 60 }
+      );
+      const r = await fetch(url);
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      snapshotJson = await r.json();
+    } catch (_e) {
+      return res.status(404).json({ ok: false, error: "SNAPSHOT_NOT_FOUND", snapshotKey });
+    }
+
+    // master-save stores data under {data: project}
+    const project = snapshotJson?.data || {};
+    const album = project?.album || {};
+    const tracks = Array.isArray(album?.tracks) ? album.tracks : [];
+
+    const shareId = `share_${isoStamp()}_${crypto.randomBytes(3).toString("hex")}`;
+    const manifestKey = `public/players/${shareId}/manifest.json`;
+
+    const manifest = {
+      ok: true,
+      shareId,
+      projectId: pid,
+      createdAt: new Date().toISOString(),
+      snapshotKey,
+      albumTitle: String(album?.albumTitle || album?.title || project?.projectName || "Album"),
+      tracks: tracks.map((t, i) => ({
+        id: String(t?.id || `t${i + 1}`),
+        slot: Number(t?.slot || i + 1),
+        title: String(t?.title || `Track ${i + 1}`),
+        playbackUrl: String(t?.playbackUrl || ""),
+        s3Key: String(t?.s3Key || ""),
+        durationSec: Number(t?.durationSec || 0) || 0,
+      })),
+    };
+
+    await s3.send(
+      new PutObjectCommand({
+        Bucket: S3_BUCKET,
+        Key: manifestKey,
+        Body: JSON.stringify(manifest, null, 2),
+        ContentType: "application/json; charset=utf-8",
+        CacheControl: "no-store",
+      })
+    );
+
+    // Return a signed URL for the manifest (works even if bucket is private)
+    const publicUrl = await getSignedUrl(
+      s3,
+      new GetObjectCommand({ Bucket: S3_BUCKET, Key: manifestKey }),
+      { expiresIn: 60 * 60 } // 1 hour
+    );
+
+    return res.json({ ok: true, shareId, manifestKey, publicUrl, snapshotKey });
+  } catch (err) {
+    console.error("publish-minisite error", err);
+    return res.status(500).json({ ok: false, error: String(err?.message || err) });
+  }
+});
+
 // ---- publish demo manifest (unchanged) ----
 const manifests = {
   demo: {
@@ -382,4 +481,3 @@ console.log("Starting album-backend...", {
 });
 
 app.listen(PORT, () => console.log(`album-backend listening on ${PORT}`));
-
