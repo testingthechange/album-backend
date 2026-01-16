@@ -2,6 +2,7 @@
 import express from "express";
 import cors from "cors";
 import multer from "multer";
+import crypto from "crypto";
 
 const app = express();
 const upload = multer({ storage: multer.memoryStorage() });
@@ -25,12 +26,31 @@ app.use(
 
 app.use(express.json());
 
+// -------------------------
+// TEMP in-memory storage
+// NOTE: will reset on redeploy/restart (OK for unblocking)
+// -------------------------
+/**
+ * key: s3Key string (from Catalog)
+ * val: { id, contentType, buffer }
+ */
+const uploadsByS3Key = new Map();
+/**
+ * key: id string
+ * val: { contentType, buffer }
+ */
+const uploadsById = new Map();
+
+function makeId() {
+  return crypto.randomBytes(12).toString("hex");
+}
+
 // ---- health (what smartbridge expects) ----
 app.get("/api/health", (_req, res) => {
   res.json({ ok: true, service: "album-backend" });
 });
 
-// ---- upload-to-s3 (stub to unblock Catalog; replace later with real upload) ----
+// ---- upload-to-s3 (TEMP) ----
 // Expects multipart form-data: file, s3Key
 // Returns: { ok:true, s3Key }
 app.post("/api/upload-to-s3", upload.single("file"), async (req, res) => {
@@ -39,7 +59,14 @@ app.post("/api/upload-to-s3", upload.single("file"), async (req, res) => {
     if (!s3Key) return res.status(400).json({ ok: false, error: "MISSING_S3KEY" });
     if (!req.file) return res.status(400).json({ ok: false, error: "NO_FILE" });
 
-    // TODO: replace stub with real R2/S3 upload.
+    const id = makeId();
+    const contentType = req.file.mimetype || "audio/mpeg";
+    const buffer = req.file.buffer;
+
+    uploadsByS3Key.set(s3Key, { id, contentType, buffer });
+    uploadsById.set(id, { contentType, buffer });
+
+    // critical: Catalog only needs ok + s3Key
     return res.json({ ok: true, s3Key });
   } catch (err) {
     return res.status(500).json({ ok: false, error: String(err?.message || err) });
@@ -54,19 +81,38 @@ app.get("/api/playback-url", async (req, res) => {
     const s3Key = String(req.query?.s3Key || "").trim();
     if (!s3Key) return res.status(400).json({ ok: false, error: "MISSING_S3KEY" });
 
-    // Minimal contract: if s3Key is already a URL, just echo it back as url.
+    // If already a URL, just echo
     if (/^https?:\/\//i.test(s3Key)) {
       return res.json({ ok: true, url: s3Key });
     }
 
-    // Otherwise, not implemented until real storage signing exists.
-    return res.status(501).json({ ok: false, error: "SIGNING_NOT_IMPLEMENTED", s3Key });
+    const found = uploadsByS3Key.get(s3Key);
+    if (!found?.id) {
+      return res.status(404).json({ ok: false, error: "UPLOAD_NOT_FOUND_FOR_S3KEY", s3Key });
+    }
+
+    const base = `${req.protocol}://${req.get("host")}`;
+    const url = `${base}/media/${encodeURIComponent(found.id)}.mp3`;
+    return res.json({ ok: true, url });
   } catch (err) {
     return res.status(500).json({ ok: false, error: String(err?.message || err) });
   }
 });
 
-// ---- publish demo manifest ----
+// ---- serve uploaded audio ----
+app.get("/media/:file", (req, res) => {
+  const file = String(req.params.file || "");
+  const id = file.replace(/\.mp3$/i, "");
+  const rec = uploadsById.get(id);
+
+  if (!rec?.buffer) return res.status(404).send("not_found");
+
+  res.setHeader("Content-Type", rec.contentType || "audio/mpeg");
+  res.setHeader("Cache-Control", "no-store");
+  return res.status(200).send(rec.buffer);
+});
+
+// ---- publish demo manifest (unchanged) ----
 const manifests = {
   demo: {
     albumTitle: "Demo Album",
@@ -101,7 +147,6 @@ app.get("/publish/:shareId.json", (req, res) => {
   return res.json({ shareId: req.params.shareId, ...manifest });
 });
 
-// root
 app.get("/", (_req, res) => {
   res.type("text").send("album-backend OK. Try /api/health or /publish/demo.json");
 });
