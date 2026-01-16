@@ -5,6 +5,8 @@ import multer from "multer";
 import crypto from "crypto";
 
 const app = express();
+app.set("trust proxy", 1);
+
 const upload = multer({ storage: multer.memoryStorage() });
 
 const ALLOWED_ORIGINS = [
@@ -21,33 +23,73 @@ app.use(
       return cb(new Error(`CORS blocked origin: ${origin}`), false);
     },
     methods: ["GET", "POST", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization"],
   })
 );
 
+app.options("*", cors());
 app.use(express.json());
 
 // -------------------------
 // TEMP in-memory storage
 // NOTE: will reset on redeploy/restart (OK for unblocking)
 // -------------------------
-/**
- * key: s3Key string (from Catalog)
- * val: { id, contentType, buffer }
- */
-const uploadsByS3Key = new Map();
-/**
- * key: id string
- * val: { contentType, buffer }
- */
-const uploadsById = new Map();
+const uploadsByS3Key = new Map(); // s3Key -> { id, contentType, buffer }
+const uploadsById = new Map(); // id -> { contentType, buffer }
+
+// Master Save temp storage (latest per project)
+const latestByProjectId = new Map(); // projectId -> { snapshotKey, latestKey, savedAt, project }
 
 function makeId() {
   return crypto.randomBytes(12).toString("hex");
 }
 
+function isoStamp() {
+  return new Date().toISOString().replace(/[:.]/g, "-");
+}
+
 // ---- health (what smartbridge expects) ----
 app.get("/api/health", (_req, res) => {
   res.json({ ok: true, service: "album-backend" });
+});
+
+// ---- master-save (TEMP) ----
+// POST /api/master-save
+// Body: { projectId, project }
+// Returns: { ok:true, snapshotKey, latestKey }
+app.post("/api/master-save", async (req, res) => {
+  try {
+    const { projectId, project } = req.body || {};
+    const pid = String(projectId || "").trim();
+    if (!pid || !project) {
+      return res.status(400).json({ ok: false, error: "Missing projectId or project" });
+    }
+
+    const now = new Date().toISOString();
+    const snapshotKey = `memory://storage/projects/${pid}/producer_returns/snapshots/${isoStamp()}.json`;
+    const latestKey = `memory://storage/projects/${pid}/producer_returns/latest.json`;
+
+    latestByProjectId.set(pid, { snapshotKey, latestKey, savedAt: now, project });
+
+    return res.json({ ok: true, snapshotKey, latestKey });
+  } catch (err) {
+    console.error("master-save error", err);
+    return res.status(500).json({ ok: false, error: String(err?.message || err) });
+  }
+});
+
+// Optional: read latest (TEMP)
+// GET /api/master-save/latest/:projectId
+app.get("/api/master-save/latest/:projectId", async (req, res) => {
+  try {
+    const pid = String(req.params.projectId || "").trim();
+    const latest = latestByProjectId.get(pid);
+    if (!latest) return res.status(404).json({ ok: false, error: "NO_LATEST", projectId: pid });
+    return res.json({ ok: true, ...latest });
+  } catch (err) {
+    console.error("master-save latest error", err);
+    return res.status(500).json({ ok: false, error: String(err?.message || err) });
+  }
 });
 
 // ---- upload-to-s3 (TEMP) ----
@@ -66,9 +108,9 @@ app.post("/api/upload-to-s3", upload.single("file"), async (req, res) => {
     uploadsByS3Key.set(s3Key, { id, contentType, buffer });
     uploadsById.set(id, { contentType, buffer });
 
-    // critical: Catalog only needs ok + s3Key
     return res.json({ ok: true, s3Key });
   } catch (err) {
+    console.error("upload-to-s3 error", err);
     return res.status(500).json({ ok: false, error: String(err?.message || err) });
   }
 });
@@ -81,7 +123,7 @@ app.get("/api/playback-url", async (req, res) => {
     const s3Key = String(req.query?.s3Key || "").trim();
     if (!s3Key) return res.status(400).json({ ok: false, error: "MISSING_S3KEY" });
 
-    // If already a URL, just echo
+    // If already a URL, echo it
     if (/^https?:\/\//i.test(s3Key)) {
       return res.json({ ok: true, url: s3Key });
     }
@@ -95,11 +137,12 @@ app.get("/api/playback-url", async (req, res) => {
     const url = `${base}/media/${encodeURIComponent(found.id)}.mp3`;
     return res.json({ ok: true, url });
   } catch (err) {
+    console.error("playback-url error", err);
     return res.status(500).json({ ok: false, error: String(err?.message || err) });
   }
 });
 
-// ---- serve uploaded audio ----
+// ---- serve uploaded audio WITH RANGE SUPPORT ----
 app.get("/media/:file", (req, res) => {
   const file = String(req.params.file || "");
   const id = file.replace(/\.mp3$/i, "");
@@ -107,9 +150,35 @@ app.get("/media/:file", (req, res) => {
 
   if (!rec?.buffer) return res.status(404).send("not_found");
 
-  res.setHeader("Content-Type", rec.contentType || "audio/mpeg");
+  const buf = rec.buffer;
+  const total = buf.length;
+  const contentType = rec.contentType || "audio/mpeg";
+
+  res.setHeader("Accept-Ranges", "bytes");
+  res.setHeader("Content-Type", contentType);
   res.setHeader("Cache-Control", "no-store");
-  return res.status(200).send(rec.buffer);
+
+  const range = req.headers.range;
+  if (!range) {
+    res.setHeader("Content-Length", total);
+    return res.status(200).send(buf);
+  }
+
+  const m = /^bytes=(\d+)-(\d*)$/.exec(range);
+  if (!m) return res.status(416).end();
+
+  const start = Number(m[1]);
+  const end = m[2] ? Number(m[2]) : total - 1;
+
+  if (Number.isNaN(start) || Number.isNaN(end) || start >= total || end >= total || end < start) {
+    return res.status(416).end();
+  }
+
+  const chunk = buf.subarray(start, end + 1);
+  res.status(206);
+  res.setHeader("Content-Range", `bytes ${start}-${end}/${total}`);
+  res.setHeader("Content-Length", chunk.length);
+  return res.send(chunk);
 });
 
 // ---- publish demo manifest (unchanged) ----
