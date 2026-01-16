@@ -28,8 +28,7 @@ process.on("unhandledRejection", (reason) => {
 const upload = multer({ storage: multer.memoryStorage() });
 
 // ---- env ----
-const { AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION, S3_BUCKET } =
-  process.env;
+const { AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION, S3_BUCKET } = process.env;
 
 const REQUIRED = ["AWS_REGION", "S3_BUCKET"];
 for (const k of REQUIRED) {
@@ -73,7 +72,6 @@ function isoStamp() {
 function randId(n = 12) {
   return crypto.randomBytes(n).toString("hex");
 }
-// kept for parity even if unused
 void randId;
 
 function safeFileName(name) {
@@ -93,6 +91,16 @@ function safeString(v) {
 function safeNum(v) {
   const n = Number(v);
   return Number.isFinite(n) ? n : 0;
+}
+
+// IMPORTANT: any "masterSnapshot_*" is NOT an S3 key. Treat as invalid.
+function isBogusSnapshotKey(k) {
+  const s = safeString(k);
+  if (!s) return true;
+  if (s.startsWith("masterSnapshot_")) return true;
+  // real S3 keys in this system are paths like "storage/projects/..../snapshots/...json"
+  if (!s.includes("/") || !s.endsWith(".json")) return true;
+  return false;
 }
 
 // ---- health ----
@@ -118,12 +126,10 @@ app.get("/api/debug/s3", (_req, res) => {
 app.post("/api/upload-to-s3", upload.single("file"), async (req, res) => {
   try {
     const projectId = String(req.query?.projectId || "").trim();
-    if (!projectId)
-      return res.status(400).json({ ok: false, error: "MISSING_PROJECT_ID" });
+    if (!projectId) return res.status(400).json({ ok: false, error: "MISSING_PROJECT_ID" });
 
     const file = req.file;
-    if (!file?.buffer)
-      return res.status(400).json({ ok: false, error: "NO_FILE" });
+    if (!file?.buffer) return res.status(400).json({ ok: false, error: "NO_FILE" });
 
     let s3Key = String(req.body?.s3Key || "").trim();
     if (!s3Key) {
@@ -146,15 +152,13 @@ app.post("/api/upload-to-s3", upload.single("file"), async (req, res) => {
     const url = await getSignedUrl(
       s3,
       new GetObjectCommand({ Bucket: S3_BUCKET, Key: s3Key }),
-      { expiresIn: 60 * 20 } // 20 minutes
+      { expiresIn: 60 * 20 }
     );
 
     return res.json({ ok: true, s3Key, url });
   } catch (err) {
     console.error("upload-to-s3 error", err);
-    return res
-      .status(500)
-      .json({ ok: false, error: String(err?.message || err) });
+    return res.status(500).json({ ok: false, error: String(err?.message || err) });
   }
 });
 
@@ -164,13 +168,10 @@ app.post("/api/upload-to-s3", upload.single("file"), async (req, res) => {
 app.get("/api/playback-url", async (req, res) => {
   try {
     const s3Key = String(req.query?.s3Key || "").trim();
-    if (!s3Key)
-      return res.status(400).json({ ok: false, error: "MISSING_S3KEY" });
+    if (!s3Key) return res.status(400).json({ ok: false, error: "MISSING_S3KEY" });
 
-    // allow demo URLs
     if (isHttpUrl(s3Key)) return res.json({ ok: true, url: s3Key });
 
-    // confirm exists
     try {
       await s3.send(new HeadObjectCommand({ Bucket: S3_BUCKET, Key: s3Key }));
     } catch (e) {
@@ -182,11 +183,7 @@ app.get("/api/playback-url", async (req, res) => {
           ok: false,
           error: "S3_ACCESS_DENIED",
           s3Key,
-          aws: {
-            name,
-            httpStatusCode: http,
-            message: String(e?.message || ""),
-          },
+          aws: { name, httpStatusCode: http, message: String(e?.message || "") },
         });
       }
 
@@ -194,26 +191,20 @@ app.get("/api/playback-url", async (req, res) => {
         ok: false,
         error: "UPLOAD_NOT_FOUND_FOR_S3KEY",
         s3Key,
-        aws: {
-          name,
-          httpStatusCode: http,
-          message: String(e?.message || ""),
-        },
+        aws: { name, httpStatusCode: http, message: String(e?.message || "") },
       });
     }
 
     const url = await getSignedUrl(
       s3,
       new GetObjectCommand({ Bucket: S3_BUCKET, Key: s3Key }),
-      { expiresIn: 60 * 20 } // 20 minutes
+      { expiresIn: 60 * 20 }
     );
 
     return res.json({ ok: true, url });
   } catch (err) {
     console.error("playback-url error", err);
-    return res
-      .status(500)
-      .json({ ok: false, error: String(err?.message || err) });
+    return res.status(500).json({ ok: false, error: String(err?.message || err) });
   }
 });
 
@@ -226,9 +217,7 @@ app.post("/api/master-save", async (req, res) => {
     const { projectId, project } = req.body || {};
     const pid = String(projectId || "").trim();
     if (!pid || !project) {
-      return res
-        .status(400)
-        .json({ ok: false, error: "Missing projectId or project" });
+      return res.status(400).json({ ok: false, error: "Missing projectId or project" });
     }
 
     const now = new Date().toISOString();
@@ -272,9 +261,7 @@ app.post("/api/master-save", async (req, res) => {
     return res.json({ ok: true, snapshotKey, latestKey });
   } catch (err) {
     console.error("master-save error", err);
-    return res
-      .status(500)
-      .json({ ok: false, error: String(err?.message || err) });
+    return res.status(500).json({ ok: false, error: String(err?.message || err) });
   }
 });
 
@@ -283,8 +270,7 @@ app.post("/api/master-save", async (req, res) => {
 app.get("/api/master-save/latest/:projectId", async (req, res) => {
   try {
     const pid = String(req.params.projectId || "").trim();
-    if (!pid)
-      return res.status(400).json({ ok: false, error: "MISSING_PROJECT_ID" });
+    if (!pid) return res.status(400).json({ ok: false, error: "MISSING_PROJECT_ID" });
 
     const latestKey = `storage/projects/${pid}/producer_returns/latest.json`;
 
@@ -303,13 +289,10 @@ app.get("/api/master-save/latest/:projectId", async (req, res) => {
     }
 
     const snapKey =
-      String(latestJson?.latestSnapshotKey || "").trim() ||
-      String(latestJson?.snapshotKey || "").trim();
+      String(latestJson?.latestSnapshotKey || "").trim() || String(latestJson?.snapshotKey || "").trim();
 
     if (!snapKey) {
-      return res
-        .status(404)
-        .json({ ok: false, error: "NO_LATEST_SNAPSHOT_KEY", latestKey });
+      return res.status(404).json({ ok: false, error: "NO_LATEST_SNAPSHOT_KEY", latestKey });
     }
 
     let snapshotJson;
@@ -323,30 +306,18 @@ app.get("/api/master-save/latest/:projectId", async (req, res) => {
       if (!r.ok) throw new Error(`HTTP ${r.status}`);
       snapshotJson = await r.json();
     } catch (_e) {
-      return res
-        .status(404)
-        .json({ ok: false, error: "SNAPSHOT_NOT_FOUND", snapshotKey: snapKey });
+      return res.status(404).json({ ok: false, error: "SNAPSHOT_NOT_FOUND", snapshotKey: snapKey });
     }
 
-    return res.json({
-      ok: true,
-      latestKey,
-      latest: latestJson,
-      snapshot: snapshotJson,
-    });
+    return res.json({ ok: true, latestKey, latest: latestJson, snapshot: snapshotJson });
   } catch (err) {
     console.error("master-save latest error", err);
-    return res
-      .status(500)
-      .json({ ok: false, error: String(err?.message || err) });
+    return res.status(500).json({ ok: false, error: String(err?.message || err) });
   }
 });
 
 /* =============================================================================
    PUBLISH (SECURE)
-   - No public S3 access required
-   - GET /publish/:shareId.json returns the manifest by re-signing URLs on demand
-   - Tracks are derived from snapshot.data.catalog.songs[*].files.album
 ============================================================================= */
 
 async function readJsonFromS3Key(key, expiresInSec = 60) {
@@ -374,7 +345,6 @@ function deriveTracksFromSnapshotData(data) {
     const s3Key = safeString(fAlbum?.s3Key);
     const existingUrl = safeString(fAlbum?.playbackUrl);
 
-    // Require at least one source pointer
     if (!s3Key && !existingUrl) continue;
 
     const durationSec = safeNum(fAlbum?.durationSec || s?.durationSec || 0);
@@ -382,8 +352,8 @@ function deriveTracksFromSnapshotData(data) {
     out.push({
       slot,
       title,
-      s3Key, // may be empty if legacy stored playbackUrl
-      playbackUrl: existingUrl, // will be replaced with fresh signed URL if s3Key exists
+      s3Key,
+      playbackUrl: existingUrl,
       durationSec,
     });
   }
@@ -392,12 +362,9 @@ function deriveTracksFromSnapshotData(data) {
 }
 
 async function signTrackPlaybackUrl(track) {
-  // Prefer signing from s3Key (security model: never trust cached presigned URLs)
   const s3Key = safeString(track?.s3Key);
   if (s3Key && !isHttpUrl(s3Key)) {
-    // existence check
     await s3.send(new HeadObjectCommand({ Bucket: S3_BUCKET, Key: s3Key }));
-
     const url = await getSignedUrl(
       s3,
       new GetObjectCommand({ Bucket: S3_BUCKET, Key: s3Key }),
@@ -406,7 +373,6 @@ async function signTrackPlaybackUrl(track) {
     return url;
   }
 
-  // If the "s3Key" is actually a URL or we only have a URL, allow it (legacy/demo)
   const u = safeString(track?.playbackUrl) || safeString(track?.s3Key);
   if (isHttpUrl(u)) return u;
 
@@ -419,10 +385,16 @@ async function signTrackPlaybackUrl(track) {
 app.post("/api/publish-minisite", async (req, res) => {
   try {
     const projectId = safeString(req.body?.projectId);
-    const providedSnapshotKey = safeString(req.body?.snapshotKey);
+    let providedSnapshotKey = safeString(req.body?.snapshotKey);
 
     if (!projectId) {
       return res.status(400).json({ ok: false, error: "MISSING_PROJECT_ID" });
+    }
+
+    // CRITICAL FIX:
+    // If frontend sends "masterSnapshot_*" (not a real S3 key), ignore it and publish from latest.json.
+    if (!providedSnapshotKey || isBogusSnapshotKey(providedSnapshotKey)) {
+      providedSnapshotKey = "";
     }
 
     // choose snapshot key
@@ -440,30 +412,27 @@ app.post("/api/publish-minisite", async (req, res) => {
     const snapshot = await readJsonFromS3Key(snapshotKey, 60);
 
     // normalize to "data" (new) or "project" (legacy)
-    const data = (snapshot && typeof snapshot === "object" ? snapshot.data : null) || snapshot.project || null;
+    const data =
+      (snapshot && typeof snapshot === "object" ? snapshot.data : null) || snapshot.project || null;
+
     if (!data || typeof data !== "object") {
       return res.status(500).json({ ok: false, error: "SNAPSHOT_MISSING_DATA", snapshotKey });
     }
 
-    // build manifest
     const createdAt = safeString(snapshot?.createdAt) || new Date().toISOString();
     const shareId = `share_${isoStamp()}_${crypto.randomBytes(3).toString("hex")}`;
 
     const albumTitle =
-      safeString(data?.album?.meta?.albumTitle) ||
-      safeString(data?.albumTitle) ||
-      "Album";
+      safeString(data?.album?.meta?.albumTitle) || safeString(data?.albumTitle) || "Album";
 
     const tracksRaw = deriveTracksFromSnapshotData(data);
 
-    // sign tracks (parallel but safe)
     const tracks = await Promise.all(
       tracksRaw.map(async (t) => {
         let url = "";
         try {
           url = await signTrackPlaybackUrl(t);
         } catch (e) {
-          // If one track is missing, keep it but without a URL (prevents whole publish from failing)
           console.error("publish: track sign failed", {
             slot: t?.slot,
             s3Key: t?.s3Key,
@@ -476,7 +445,6 @@ app.post("/api/publish-minisite", async (req, res) => {
           title: safeString(t.title) || `Track ${safeNum(t.slot)}`,
           durationSec: safeNum(t.durationSec || 0),
           playbackUrl: url,
-          // keep s3Key for debugging/lineage (not required by Product)
           s3Key: safeString(t.s3Key),
         };
       })
@@ -507,6 +475,7 @@ app.post("/api/publish-minisite", async (req, res) => {
 
     const publicUrl = `${req.protocol}://${req.get("host")}/publish/${encodeURIComponent(shareId)}.json`;
 
+    // NOTE: snapshotKey returned here is ALWAYS the real S3 snapshot key (never "masterSnapshot_*").
     return res.json({ ok: true, shareId, manifestKey, publicUrl, snapshotKey });
   } catch (err) {
     console.error("publish-minisite error", err);
@@ -523,7 +492,6 @@ app.get("/publish/:shareId.json", async (req, res) => {
 
     const manifestKey = `public/players/${shareId}/manifest.json`;
 
-    // read stored manifest
     let manifest;
     try {
       manifest = await readJsonFromS3Key(manifestKey, 60);
@@ -531,7 +499,6 @@ app.get("/publish/:shareId.json", async (req, res) => {
       return res.status(404).json({ ok: false, error: "MANIFEST_NOT_FOUND", manifestKey, shareId });
     }
 
-    // re-sign tracks each request
     const tracksIn = Array.isArray(manifest?.tracks) ? manifest.tracks : [];
     const tracksOut = await Promise.all(
       tracksIn.map(async (t) => {
@@ -550,11 +517,10 @@ app.get("/publish/:shareId.json", async (req, res) => {
               new GetObjectCommand({ Bucket: S3_BUCKET, Key: s3Key }),
               { expiresIn: 60 * 20 }
             );
-          } catch (e) {
+          } catch (_e) {
             playbackUrl = "";
           }
         } else {
-          // allow legacy/demo url
           const u = safeString(t?.playbackUrl) || safeString(s3Key);
           playbackUrl = isHttpUrl(u) ? u : "";
         }
@@ -608,8 +574,10 @@ const manifests = {
   },
 };
 
+// keep a simple list endpoint for demo shareIds
 app.get("/publish", (_req, res) => res.json({ shareIds: Object.keys(manifests) }));
 
+// demo manifest endpoint (separate suffix to avoid clashing with real shareIds)
 app.get("/publish/:shareId.json.demo", (req, res) => {
   const manifest = manifests[req.params.shareId];
   if (!manifest) return res.status(404).json({ error: "not_found", shareId: req.params.shareId });
@@ -618,7 +586,7 @@ app.get("/publish/:shareId.json.demo", (req, res) => {
 
 // root
 app.get("/", (_req, res) => {
-  res.type("text").send("album-backend OK. Try /api/health or /publish/demo.json");
+  res.type("text").send("album-backend OK. Try /api/health or /publish/<shareId>.json");
 });
 
 const PORT = process.env.PORT || 3000;
