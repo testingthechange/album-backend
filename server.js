@@ -6,7 +6,6 @@ import multer from "multer";
 const app = express();
 const upload = multer({ storage: multer.memoryStorage() });
 
-// IMPORTANT: allow both frontends
 const ALLOWED_ORIGINS = [
   "https://betablocker.onrender.com",
   "https://smartbridge2.onrender.com",
@@ -21,11 +20,9 @@ app.use(
       return cb(new Error(`CORS blocked origin: ${origin}`), false);
     },
     methods: ["GET", "POST", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Authorization"],
   })
 );
 
-app.options("*", cors());
 app.use(express.json());
 
 // ---- health (what smartbridge expects) ----
@@ -33,7 +30,7 @@ app.get("/api/health", (_req, res) => {
   res.json({ ok: true, service: "album-backend" });
 });
 
-// ---- upload-to-s3 (stub to unblock UI) ----
+// ---- upload-to-s3 (stub to unblock Catalog; replace later with real upload) ----
 // Expects multipart form-data: file, s3Key
 // Returns: { ok:true, s3Key }
 app.post("/api/upload-to-s3", upload.single("file"), async (req, res) => {
@@ -42,45 +39,34 @@ app.post("/api/upload-to-s3", upload.single("file"), async (req, res) => {
     if (!s3Key) return res.status(400).json({ ok: false, error: "MISSING_S3KEY" });
     if (!req.file) return res.status(400).json({ ok: false, error: "NO_FILE" });
 
-    // TODO: replace this stub with real R2/S3 upload.
-    // For now we just echo s3Key so Catalog can proceed.
+    // TODO: replace stub with real R2/S3 upload.
     return res.json({ ok: true, s3Key });
   } catch (err) {
     return res.status(500).json({ ok: false, error: String(err?.message || err) });
   }
 });
 
-// ---- playback-url (REQUIRED for Catalog to play audio) ----
-// Catalog calls: GET /api/playback-url?s3Key=...
-// For now: treat s3Key as a URL if it looks like one; otherwise return a safe error.
-// This prevents "Upload did not return s3Key" follow-on failures and stops 404s.
+// ---- playback-url (Smartbridge Catalog expects this) ----
+// GET /api/playback-url?s3Key=...
+// Returns: { ok:true, url }
 app.get("/api/playback-url", async (req, res) => {
   try {
     const s3Key = String(req.query?.s3Key || "").trim();
     if (!s3Key) return res.status(400).json({ ok: false, error: "MISSING_S3KEY" });
 
-    // TEMP behavior:
-    // - If s3Key is already a full URL (http/https), return it directly.
-    // - Otherwise, we can't sign yet (no R2/S3 wired), so return a clear error (not 404).
-    const isUrl = /^https?:\/\/.+/i.test(s3Key);
-
-    if (isUrl) {
+    // Minimal contract: if s3Key is already a URL, just echo it back as url.
+    if (/^https?:\/\//i.test(s3Key)) {
       return res.json({ ok: true, url: s3Key });
     }
 
-    return res.status(501).json({
-      ok: false,
-      error: "PLAYBACK_URL_NOT_IMPLEMENTED",
-      note:
-        "upload-to-s3 is currently a stub that echoes s3Key. Wire real R2/S3 upload + signing to return a playable URL.",
-      s3Key,
-    });
+    // Otherwise, not implemented until real storage signing exists.
+    return res.status(501).json({ ok: false, error: "SIGNING_NOT_IMPLEMENTED", s3Key });
   } catch (err) {
     return res.status(500).json({ ok: false, error: String(err?.message || err) });
   }
 });
 
-// ---- publish demo manifest (your existing contract) ----
+// ---- publish demo manifest ----
 const manifests = {
   demo: {
     albumTitle: "Demo Album",
