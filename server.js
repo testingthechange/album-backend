@@ -15,15 +15,21 @@ import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 const app = express();
 app.set("trust proxy", 1);
 
+// Crash visibility (Render sometimes only shows "exited early" otherwise)
+process.on("uncaughtException", (err) => {
+  console.error("UNCAUGHT_EXCEPTION", err);
+  process.exit(1);
+});
+process.on("unhandledRejection", (reason) => {
+  console.error("UNHANDLED_REJECTION", reason);
+  process.exit(1);
+});
+
 const upload = multer({ storage: multer.memoryStorage() });
 
 // ---- env ----
-const {
-  AWS_ACCESS_KEY_ID,
-  AWS_SECRET_ACCESS_KEY,
-  AWS_REGION,
-  S3_BUCKET,
-} = process.env;
+const { AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION, S3_BUCKET } =
+  process.env;
 
 const REQUIRED = ["AWS_REGION", "S3_BUCKET"];
 for (const k of REQUIRED) {
@@ -73,6 +79,9 @@ function isoStamp() {
 function randId(n = 12) {
   return crypto.randomBytes(n).toString("hex");
 }
+// kept for parity even if unused
+void randId;
+
 function safeFileName(name) {
   const raw = String(name || "file");
   return raw.replace(/[^a-zA-Z0-9._-]+/g, "_");
@@ -91,14 +100,13 @@ app.get("/api/health", (_req, res) => {
 });
 
 // ---- debug (TEMP) ----
-// Useful to confirm Render env + bucket/region are what you think.
-// Remove after diagnosis.
 app.get("/api/debug/s3", (_req, res) => {
   res.json({
     ok: true,
     region: AWS_REGION || null,
     bucket: S3_BUCKET || null,
     hasExplicitKeys: Boolean(AWS_ACCESS_KEY_ID && AWS_SECRET_ACCESS_KEY),
+    node: process.version,
   });
 });
 
@@ -109,10 +117,12 @@ app.get("/api/debug/s3", (_req, res) => {
 app.post("/api/upload-to-s3", upload.single("file"), async (req, res) => {
   try {
     const projectId = String(req.query?.projectId || "").trim();
-    if (!projectId) return res.status(400).json({ ok: false, error: "MISSING_PROJECT_ID" });
+    if (!projectId)
+      return res.status(400).json({ ok: false, error: "MISSING_PROJECT_ID" });
 
     const file = req.file;
-    if (!file?.buffer) return res.status(400).json({ ok: false, error: "NO_FILE" });
+    if (!file?.buffer)
+      return res.status(400).json({ ok: false, error: "NO_FILE" });
 
     // MUST honor frontend-provided s3Key (so playback-url matches)
     let s3Key = String(req.body?.s3Key || "").trim();
@@ -134,8 +144,7 @@ app.post("/api/upload-to-s3", upload.single("file"), async (req, res) => {
       })
     );
 
-    // Convenience: return a signed URL immediately so the client can play without
-    // needing a second round-trip.
+    // Convenience: return a signed URL immediately
     const url = await getSignedUrl(
       s3,
       new GetObjectCommand({ Bucket: S3_BUCKET, Key: s3Key }),
@@ -155,7 +164,8 @@ app.post("/api/upload-to-s3", upload.single("file"), async (req, res) => {
 app.get("/api/playback-url", async (req, res) => {
   try {
     const s3Key = String(req.query?.s3Key || "").trim();
-    if (!s3Key) return res.status(400).json({ ok: false, error: "MISSING_S3KEY" });
+    if (!s3Key)
+      return res.status(400).json({ ok: false, error: "MISSING_S3KEY" });
 
     // allow demo URLs
     if (isHttpUrl(s3Key)) return res.json({ ok: true, url: s3Key });
@@ -167,7 +177,6 @@ app.get("/api/playback-url", async (req, res) => {
       const name = String(e?.name || "");
       const http = e?.$metadata?.httpStatusCode;
 
-      // If perms are broken, do NOT report "not found" (it hides the real issue).
       if (name === "AccessDenied" || http === 403) {
         return res.status(403).json({
           ok: false,
@@ -215,7 +224,9 @@ app.post("/api/master-save", async (req, res) => {
     const { projectId, project } = req.body || {};
     const pid = String(projectId || "").trim();
     if (!pid || !project) {
-      return res.status(400).json({ ok: false, error: "Missing projectId or project" });
+      return res
+        .status(400)
+        .json({ ok: false, error: "Missing projectId or project" });
     }
 
     const now = new Date().toISOString();
@@ -283,7 +294,7 @@ app.get("/api/master-save/latest/:projectId", async (req, res) => {
       const r = await fetch(url);
       if (!r.ok) throw new Error(`HTTP ${r.status}`);
       latestJson = await r.json();
-    } catch (e) {
+    } catch (_e) {
       return res.status(404).json({ ok: false, error: "NO_LATEST", latestKey });
     }
 
@@ -292,7 +303,9 @@ app.get("/api/master-save/latest/:projectId", async (req, res) => {
       String(latestJson?.snapshotKey || "").trim();
 
     if (!snapKey) {
-      return res.status(404).json({ ok: false, error: "NO_LATEST_SNAPSHOT_KEY", latestKey });
+      return res
+        .status(404)
+        .json({ ok: false, error: "NO_LATEST_SNAPSHOT_KEY", latestKey });
     }
 
     // fetch snapshot
@@ -306,8 +319,10 @@ app.get("/api/master-save/latest/:projectId", async (req, res) => {
       const r = await fetch(url);
       if (!r.ok) throw new Error(`HTTP ${r.status}`);
       snapshotJson = await r.json();
-    } catch (e) {
-      return res.status(404).json({ ok: false, error: "SNAPSHOT_NOT_FOUND", snapshotKey: snapKey });
+    } catch (_e) {
+      return res
+        .status(404)
+        .json({ ok: false, error: "SNAPSHOT_NOT_FOUND", snapshotKey: snapKey });
     }
 
     return res.json({ ok: true, latestKey, latest: latestJson, snapshot: snapshotJson });
@@ -343,4 +358,28 @@ const manifests = {
     ],
   },
 };
+
+app.get("/publish", (_req, res) => res.json({ shareIds: Object.keys(manifests) }));
+
+app.get("/publish/:shareId.json", (req, res) => {
+  const manifest = manifests[req.params.shareId];
+  if (!manifest) return res.status(404).json({ error: "not_found", shareId: req.params.shareId });
+  return res.json({ shareId: req.params.shareId, ...manifest });
+});
+
+// root
+app.get("/", (_req, res) => {
+  res.type("text").send("album-backend OK. Try /api/health or /publish/demo.json");
+});
+
+const PORT = process.env.PORT || 3000;
+
+console.log("Starting album-backend...", {
+  node: process.version,
+  port: PORT,
+  region: AWS_REGION || null,
+  bucket: S3_BUCKET || null,
+});
+
+app.listen(PORT, () => console.log(`album-backend listening on ${PORT}`));
 
