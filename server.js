@@ -73,9 +73,7 @@ async function readJsonFromS3Key(key, expiresInSec = 60) {
 }
 
 function deriveTracksFromSnapshotData(data) {
-  const songs = Array.isArray(data?.catalog?.songs)
-    ? data.catalog.songs
-    : [];
+  const songs = Array.isArray(data?.catalog?.songs) ? data.catalog.songs : [];
   const out = [];
 
   for (const s of songs) {
@@ -102,17 +100,43 @@ function deriveTracksFromSnapshotData(data) {
 }
 
 async function signTrackPlaybackUrl(track) {
-  if (track.s3Key && !isHttpUrl(track.s3Key)) {
-    await s3.send(
-      new HeadObjectCommand({ Bucket: S3_BUCKET, Key: track.s3Key })
-    );
+  const s3Key = safeString(track?.s3Key);
+  if (s3Key && !isHttpUrl(s3Key)) {
+    await s3.send(new HeadObjectCommand({ Bucket: S3_BUCKET, Key: s3Key }));
     return getSignedUrl(
       s3,
-      new GetObjectCommand({ Bucket: S3_BUCKET, Key: track.s3Key }),
+      new GetObjectCommand({ Bucket: S3_BUCKET, Key: s3Key }),
       { expiresIn: 60 * 20 }
     );
   }
-  return track.playbackUrl || "";
+  const u = safeString(track?.playbackUrl) || safeString(track?.s3Key);
+  return isHttpUrl(u) ? u : "";
+}
+
+// Pull meta + cover from snapshot in a safe, predictable way
+function deriveAlbumMetaFromSnapshotData(data) {
+  const albumMeta = data?.album?.meta || {};
+  const albumCover = data?.album?.cover || {};
+
+  const albumTitle =
+    safeString(albumMeta?.albumTitle) || safeString(data?.albumTitle) || "Album";
+
+  const artistName = safeString(albumMeta?.artistName) || "";
+  const releaseDate = safeString(albumMeta?.releaseDate) || "";
+
+  // cover can be stored a few ways; prefer previewUrl if present
+  const coverUrl =
+    safeString(albumCover?.previewUrl) ||
+    safeString(albumCover?.url) ||
+    safeString(albumCover?.playbackUrl) ||
+    safeString(data?.coverUrl) ||
+    "";
+
+  return {
+    albumTitle,
+    meta: { albumTitle, artistName, releaseDate },
+    coverUrl,
+  };
 }
 
 /* =======================
@@ -128,43 +152,65 @@ app.post("/api/publish-minisite", async (req, res) => {
       return res.status(400).json({ ok: false, error: "MISSING_PROJECT_ID" });
     }
 
+    // If the caller passed bogus key, publish from latest.json
     if (!snapshotKey || isBogusSnapshotKey(snapshotKey)) {
       const latestKey = `storage/projects/${projectId}/producer_returns/latest.json`;
       const latest = await readJsonFromS3Key(latestKey);
-      snapshotKey = safeString(latest?.latestSnapshotKey);
+      snapshotKey = safeString(latest?.latestSnapshotKey) || "";
+    }
+
+    if (!snapshotKey || isBogusSnapshotKey(snapshotKey)) {
+      return res
+        .status(404)
+        .json({ ok: false, error: "NO_LATEST_SNAPSHOT_KEY" });
     }
 
     const snapshot = await readJsonFromS3Key(snapshotKey);
-    const data = snapshot?.data;
 
-    const albumMeta = data?.album?.meta || {};
-    const albumCover = data?.album?.cover || {};
+    // Normalize: new snapshots use {data}, older may use {project}
+    const data =
+      (snapshot && typeof snapshot === "object" ? snapshot.data : null) ||
+      snapshot?.project ||
+      null;
+
+    if (!data || typeof data !== "object") {
+      return res.status(500).json({
+        ok: false,
+        error: "SNAPSHOT_MISSING_DATA",
+        snapshotKey,
+      });
+    }
+
+    const createdAt = safeString(snapshot?.createdAt) || new Date().toISOString();
+    const shareId = `share_${isoStamp()}_${crypto
+      .randomBytes(3)
+      .toString("hex")}`;
+
+    const { albumTitle, meta, coverUrl } = deriveAlbumMetaFromSnapshotData(data);
 
     const tracksRaw = deriveTracksFromSnapshotData(data);
     const tracks = await Promise.all(
       tracksRaw.map(async (t) => ({
-        ...t,
+        slot: safeNum(t.slot),
+        title: safeString(t.title) || `Track ${safeNum(t.slot)}`,
+        durationSec: safeNum(t.durationSec || 0),
+        s3Key: safeString(t.s3Key),
         playbackUrl: await signTrackPlaybackUrl(t),
       }))
     );
-
-    const shareId = `share_${isoStamp()}_${crypto
-      .randomBytes(3)
-      .toString("hex")}`;
 
     const manifest = {
       ok: true,
       shareId,
       projectId,
-      createdAt: snapshot?.createdAt || new Date().toISOString(),
+      createdAt,
       snapshotKey,
 
-      albumTitle: safeString(albumMeta.albumTitle) || "Album",
-      artistName: safeString(albumMeta.artistName) || "",
-      releaseDate: safeString(albumMeta.releaseDate) || "",
-      coverUrl: safeString(albumCover.previewUrl) || "",
+      albumTitle,
+      meta,
+      coverUrl,
 
-      tracks,
+      tracks: tracks.filter((t) => t && t.slot),
     };
 
     const manifestKey = `public/players/${shareId}/manifest.json`;
@@ -174,7 +220,7 @@ app.post("/api/publish-minisite", async (req, res) => {
         Bucket: S3_BUCKET,
         Key: manifestKey,
         Body: JSON.stringify(manifest, null, 2),
-        ContentType: "application/json",
+        ContentType: "application/json; charset=utf-8",
         CacheControl: "no-store",
       })
     );
@@ -183,28 +229,49 @@ app.post("/api/publish-minisite", async (req, res) => {
       ok: true,
       shareId,
       manifestKey,
-      publicUrl: `${req.protocol}://${req.get(
-        "host"
-      )}/publish/${shareId}.json`,
+      publicUrl: `${req.protocol}://${req.get("host")}/publish/${shareId}.json`,
       snapshotKey,
     });
   } catch (err) {
     console.error("publish-minisite error", err);
-    return res.status(500).json({ ok: false, error: String(err) });
+    return res
+      .status(500)
+      .json({ ok: false, error: String(err?.message || err) });
   }
 });
 
+// GET returns the manifest (already contains coverUrl + meta)
+// If you later re-sign here, keep these fields in the response.
 app.get("/publish/:shareId.json", async (req, res) => {
   try {
-    const manifestKey = `public/players/${req.params.shareId}/manifest.json`;
+    const shareId = safeString(req.params.shareId);
+    if (!shareId) return res.status(400).json({ ok: false, error: "MISSING_SHARE_ID" });
+
+    const manifestKey = `public/players/${shareId}/manifest.json`;
     const manifest = await readJsonFromS3Key(manifestKey);
-    return res.json(manifest);
-  } catch {
-    return res.status(404).json({ ok: false });
+
+    // Ensure shape stability (in case older manifests exist)
+    return res.json({
+      ok: true,
+      shareId: safeString(manifest?.shareId) || shareId,
+      projectId: safeString(manifest?.projectId),
+      createdAt: safeString(manifest?.createdAt),
+      snapshotKey: safeString(manifest?.snapshotKey),
+
+      albumTitle: safeString(manifest?.albumTitle) || "Album",
+      meta: manifest?.meta || {
+        albumTitle: safeString(manifest?.albumTitle) || "Album",
+        artistName: "",
+        releaseDate: "",
+      },
+      coverUrl: safeString(manifest?.coverUrl || ""),
+
+      tracks: Array.isArray(manifest?.tracks) ? manifest.tracks : [],
+    });
+  } catch (e) {
+    return res.status(404).json({ ok: false, error: "MANIFEST_NOT_FOUND" });
   }
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () =>
-  console.log(`album-backend listening on ${PORT}`)
-);
+app.listen(PORT, () => console.log(`album-backend listening on ${PORT}`));
