@@ -26,8 +26,12 @@ process.on("unhandledRejection", (reason) => {
 
 const upload = multer({ storage: multer.memoryStorage() });
 
+// ---- env ----
 const { AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION, S3_BUCKET } =
   process.env;
+
+if (!AWS_REGION) console.error("Missing required env var: AWS_REGION");
+if (!S3_BUCKET) console.error("Missing required env var: S3_BUCKET");
 
 const s3 = new S3Client({
   region: AWS_REGION,
@@ -37,9 +41,30 @@ const s3 = new S3Client({
       : undefined,
 });
 
-app.use(cors());
+// ---- CORS ----
+const ALLOWED_ORIGINS = [
+  "https://smartbridge2.onrender.com",
+  "https://betablocker.onrender.com",
+  "http://localhost:5173",
+  "http://localhost:4173",
+];
+
+app.use(
+  cors({
+    origin: (origin, cb) => {
+      if (!origin) return cb(null, true);
+      if (ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
+      return cb(new Error(`CORS blocked origin: ${origin}`), false);
+    },
+    methods: ["GET", "POST", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization"],
+  })
+);
+
+app.options("*", cors());
 app.use(express.json());
 
+// ---- helpers ----
 function isoStamp() {
   return new Date().toISOString().replace(/[:.]/g, "-");
 }
@@ -53,6 +78,7 @@ function safeNum(v) {
 function isHttpUrl(s) {
   return /^https?:\/\//i.test(String(s || ""));
 }
+// IMPORTANT: any "masterSnapshot_*" is NOT an S3 key. Treat as invalid.
 function isBogusSnapshotKey(k) {
   const s = safeString(k);
   if (!s) return true;
@@ -72,6 +98,112 @@ async function readJsonFromS3Key(key, expiresInSec = 60) {
   return r.json();
 }
 
+// ---- health ----
+app.get("/api/health", (_req, res) => {
+  res.json({ ok: true, service: "album-backend" });
+});
+
+// ---- master-save (S3 JSON) ----
+// POST /api/master-save
+// Body: { projectId, project }
+// Returns: { ok:true, snapshotKey, latestKey }
+app.post("/api/master-save", async (req, res) => {
+  try {
+    const { projectId, project } = req.body || {};
+    const pid = safeString(projectId);
+    if (!pid || !project) {
+      return res
+        .status(400)
+        .json({ ok: false, error: "Missing projectId or project" });
+    }
+
+    const now = new Date().toISOString();
+    const ts = isoStamp();
+
+    const snapshotKey = `storage/projects/${pid}/producer_returns/snapshots/${ts}.json`;
+    const latestKey = `storage/projects/${pid}/producer_returns/latest.json`;
+
+    const snapshotBody = JSON.stringify(
+      { projectId: pid, createdAt: now, source: "minisite-master-save", data: project },
+      null,
+      2
+    );
+
+    const latestBody = JSON.stringify(
+      { projectId: pid, latestSnapshotKey: snapshotKey, lastMasterSaveAt: now },
+      null,
+      2
+    );
+
+    await s3.send(
+      new PutObjectCommand({
+        Bucket: S3_BUCKET,
+        Key: snapshotKey,
+        Body: snapshotBody,
+        ContentType: "application/json; charset=utf-8",
+        CacheControl: "no-store",
+      })
+    );
+
+    await s3.send(
+      new PutObjectCommand({
+        Bucket: S3_BUCKET,
+        Key: latestKey,
+        Body: latestBody,
+        ContentType: "application/json; charset=utf-8",
+        CacheControl: "no-store",
+      })
+    );
+
+    return res.json({ ok: true, snapshotKey, latestKey });
+  } catch (err) {
+    console.error("master-save error", err);
+    return res
+      .status(500)
+      .json({ ok: false, error: String(err?.message || err) });
+  }
+});
+
+// ---- master-save latest ----
+// GET /api/master-save/latest/:projectId
+app.get("/api/master-save/latest/:projectId", async (req, res) => {
+  try {
+    const pid = safeString(req.params.projectId);
+    if (!pid) return res.status(400).json({ ok: false, error: "MISSING_PROJECT_ID" });
+
+    const latestKey = `storage/projects/${pid}/producer_returns/latest.json`;
+
+    let latestJson;
+    try {
+      latestJson = await readJsonFromS3Key(latestKey, 60);
+    } catch (_e) {
+      return res.status(404).json({ ok: false, error: "NO_LATEST", latestKey });
+    }
+
+    const snapshotKey =
+      safeString(latestJson?.latestSnapshotKey) || safeString(latestJson?.snapshotKey);
+
+    if (!snapshotKey) {
+      return res.status(404).json({ ok: false, error: "NO_LATEST_SNAPSHOT_KEY", latestKey });
+    }
+
+    let snapshotJson;
+    try {
+      snapshotJson = await readJsonFromS3Key(snapshotKey, 60);
+    } catch (_e) {
+      return res.status(404).json({ ok: false, error: "SNAPSHOT_NOT_FOUND", snapshotKey });
+    }
+
+    return res.json({ ok: true, latestKey, latest: latestJson, snapshot: snapshotJson });
+  } catch (err) {
+    console.error("master-save latest error", err);
+    return res
+      .status(500)
+      .json({ ok: false, error: String(err?.message || err) });
+  }
+});
+
+// ---- publish helpers ----
 function deriveTracksFromSnapshotData(data) {
   const songs = Array.isArray(data?.catalog?.songs) ? data.catalog.songs : [];
   const out = [];
@@ -113,7 +245,6 @@ async function signTrackPlaybackUrl(track) {
   return isHttpUrl(u) ? u : "";
 }
 
-// Pull meta + cover from snapshot in a safe, predictable way
 function deriveAlbumMetaFromSnapshotData(data) {
   const albumMeta = data?.album?.meta || {};
   const albumCover = data?.album?.cover || {};
@@ -124,11 +255,9 @@ function deriveAlbumMetaFromSnapshotData(data) {
   const artistName = safeString(albumMeta?.artistName) || "";
   const releaseDate = safeString(albumMeta?.releaseDate) || "";
 
-  // cover can be stored a few ways; prefer previewUrl if present
   const coverUrl =
     safeString(albumCover?.previewUrl) ||
     safeString(albumCover?.url) ||
-    safeString(albumCover?.playbackUrl) ||
     safeString(data?.coverUrl) ||
     "";
 
@@ -152,39 +281,29 @@ app.post("/api/publish-minisite", async (req, res) => {
       return res.status(400).json({ ok: false, error: "MISSING_PROJECT_ID" });
     }
 
-    // If the caller passed bogus key, publish from latest.json
     if (!snapshotKey || isBogusSnapshotKey(snapshotKey)) {
       const latestKey = `storage/projects/${projectId}/producer_returns/latest.json`;
-      const latest = await readJsonFromS3Key(latestKey);
+      const latest = await readJsonFromS3Key(latestKey, 60);
       snapshotKey = safeString(latest?.latestSnapshotKey) || "";
     }
 
     if (!snapshotKey || isBogusSnapshotKey(snapshotKey)) {
-      return res
-        .status(404)
-        .json({ ok: false, error: "NO_LATEST_SNAPSHOT_KEY" });
+      return res.status(404).json({ ok: false, error: "NO_LATEST_SNAPSHOT_KEY" });
     }
 
-    const snapshot = await readJsonFromS3Key(snapshotKey);
+    const snapshot = await readJsonFromS3Key(snapshotKey, 60);
 
-    // Normalize: new snapshots use {data}, older may use {project}
     const data =
       (snapshot && typeof snapshot === "object" ? snapshot.data : null) ||
       snapshot?.project ||
       null;
 
     if (!data || typeof data !== "object") {
-      return res.status(500).json({
-        ok: false,
-        error: "SNAPSHOT_MISSING_DATA",
-        snapshotKey,
-      });
+      return res.status(500).json({ ok: false, error: "SNAPSHOT_MISSING_DATA", snapshotKey });
     }
 
     const createdAt = safeString(snapshot?.createdAt) || new Date().toISOString();
-    const shareId = `share_${isoStamp()}_${crypto
-      .randomBytes(3)
-      .toString("hex")}`;
+    const shareId = `share_${isoStamp()}_${crypto.randomBytes(3).toString("hex")}`;
 
     const { albumTitle, meta, coverUrl } = deriveAlbumMetaFromSnapshotData(data);
 
@@ -205,11 +324,9 @@ app.post("/api/publish-minisite", async (req, res) => {
       projectId,
       createdAt,
       snapshotKey,
-
       albumTitle,
       meta,
       coverUrl,
-
       tracks: tracks.filter((t) => t && t.slot),
     };
 
@@ -234,30 +351,24 @@ app.post("/api/publish-minisite", async (req, res) => {
     });
   } catch (err) {
     console.error("publish-minisite error", err);
-    return res
-      .status(500)
-      .json({ ok: false, error: String(err?.message || err) });
+    return res.status(500).json({ ok: false, error: String(err?.message || err) });
   }
 });
 
-// GET returns the manifest (already contains coverUrl + meta)
-// If you later re-sign here, keep these fields in the response.
 app.get("/publish/:shareId.json", async (req, res) => {
   try {
     const shareId = safeString(req.params.shareId);
     if (!shareId) return res.status(400).json({ ok: false, error: "MISSING_SHARE_ID" });
 
     const manifestKey = `public/players/${shareId}/manifest.json`;
-    const manifest = await readJsonFromS3Key(manifestKey);
+    const manifest = await readJsonFromS3Key(manifestKey, 60);
 
-    // Ensure shape stability (in case older manifests exist)
     return res.json({
       ok: true,
       shareId: safeString(manifest?.shareId) || shareId,
       projectId: safeString(manifest?.projectId),
       createdAt: safeString(manifest?.createdAt),
       snapshotKey: safeString(manifest?.snapshotKey),
-
       albumTitle: safeString(manifest?.albumTitle) || "Album",
       meta: manifest?.meta || {
         albumTitle: safeString(manifest?.albumTitle) || "Album",
@@ -265,13 +376,23 @@ app.get("/publish/:shareId.json", async (req, res) => {
         releaseDate: "",
       },
       coverUrl: safeString(manifest?.coverUrl || ""),
-
       tracks: Array.isArray(manifest?.tracks) ? manifest.tracks : [],
     });
-  } catch (e) {
+  } catch (_e) {
     return res.status(404).json({ ok: false, error: "MANIFEST_NOT_FOUND" });
   }
 });
 
+// root
+app.get("/", (_req, res) => {
+  res.type("text").send("album-backend OK. Try /api/health or /publish/<shareId>.json");
+});
+
 const PORT = process.env.PORT || 3000;
+console.log("Starting album-backend...", {
+  node: process.version,
+  port: PORT,
+  region: AWS_REGION || null,
+  bucket: S3_BUCKET || null,
+});
 app.listen(PORT, () => console.log(`album-backend listening on ${PORT}`));
