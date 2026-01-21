@@ -76,6 +76,17 @@ function isoStamp() {
 function safeString(v) {
   return String(v ?? "").trim();
 }
+function safeNum(v) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : 0;
+}
+function isBogusSnapshotKey(k) {
+  const s = safeString(k);
+  if (!s) return true;
+  if (s.startsWith("masterSnapshot_")) return true;
+  if (!s.includes("/") || !s.endsWith(".json")) return true;
+  return false;
+}
 function randHex(bytes = 8) {
   return crypto.randomBytes(bytes).toString("hex");
 }
@@ -89,81 +100,106 @@ async function signS3Key(key, expiresInSec = 60 * 20) {
   );
 }
 
+async function readJsonFromS3Key(key, expiresInSec = 60) {
+  const url = await getSignedUrl(
+    s3,
+    new GetObjectCommand({ Bucket: S3_BUCKET, Key: key }),
+    { expiresIn: expiresInSec }
+  );
+  const r = await fetch(url);
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  return r.json();
+}
+
+async function putJson(key, obj) {
+  await s3.send(
+    new PutObjectCommand({
+      Bucket: S3_BUCKET,
+      Key: key,
+      Body: Buffer.from(JSON.stringify(obj)),
+      ContentType: "application/json; charset=utf-8",
+      CacheControl: "no-store",
+    })
+  );
+}
+
+async function getJsonIfExists(key) {
+  try {
+    return await readJsonFromS3Key(key, 60);
+  } catch {
+    return null;
+  }
+}
+
 // ---- health ----
 app.get("/api/health", (_req, res) => {
   res.json({ ok: true, service: "album-backend" });
 });
 
 /* =========================================================
-   MASTER SAVE (PUBLISHER + ALBUM COMPAT)
-   - S3 content: PROJECT JSON ONLY (Album/Catalog compat)
-   - Returns snapshotKey that Publisher expects (producer_returns)
+   MASTER SAVE (UPDATED)
+   Goals:
+   - Store PROJECT JSON ONLY in S3 snapshots (Album/Catalog compat)
+   - Maintain legacy Publisher flow (producer_returns snapshot + latest.json)
+   - Maintain master_saves history (for Album pipeline)
+   Returns:
+     { ok:true, snapshotKey, latestKey, masterSnapshotKey }
+   Where snapshotKey/latestKey are producer_returns (Publisher expects that).
 ========================================================= */
 
 app.post("/api/master-save", async (req, res) => {
   try {
-    const projectId = safeString(req.body?.projectId);
+    const pid = safeString(req.body?.projectId);
     const project = req.body?.project;
 
-    if (!projectId) {
-      return res.status(400).json({ ok: false, error: "MISSING_PROJECT_ID" });
-    }
+    if (!pid) return res.status(400).json({ ok: false, error: "MISSING_PROJECT_ID" });
     if (project == null || typeof project !== "object") {
-      return res
-        .status(400)
-        .json({ ok: false, error: "MISSING_PROJECT_OBJECT" });
+      return res.status(400).json({ ok: false, error: "MISSING_PROJECT_OBJECT" });
     }
     if (!AWS_REGION || !S3_BUCKET) {
       return res.status(500).json({ ok: false, error: "S3_NOT_CONFIGURED" });
     }
 
-    const stamp = isoStamp();
-    const nonce = randHex(8);
+    const ts = isoStamp();
+    const nonce = randHex(6);
+    const now = new Date().toISOString();
 
-    // History (Album/Catalog)
+    // 1) Album/Catalog history (new)
     const masterSnapshotKey =
-      `storage/projects/${projectId}/master_saves/snapshots/${stamp}__${nonce}.json`;
+      `storage/projects/${pid}/master_saves/snapshots/${ts}__${nonce}.json`;
 
-    // Canonical for Publisher (Smartbridge Export/Tools expects producer_returns)
-    const producerLatestKey =
-      `storage/projects/${projectId}/producer_returns/snapshots/latest.json`;
+    // 2) Publisher canonical snapshot (legacy expectation)
+    //    This is the "short version" key Publisher wants to already have.
+    const snapshotKey =
+      `storage/projects/${pid}/producer_returns/snapshots/${ts}.json`;
+    const latestKey =
+      `storage/projects/${pid}/producer_returns/snapshots/latest.json`;
 
-    // ✅ Critical: store raw project JSON (not wrapper)
-    const body = Buffer.from(JSON.stringify(project));
+    // 3) Producer returns "latest pointer" metadata (legacy)
+    const latestMetaKey =
+      `storage/projects/${pid}/producer_returns/latest.json`;
 
-    // 1) Write history snapshot
-    await s3.send(
-      new PutObjectCommand({
-        Bucket: S3_BUCKET,
-        Key: masterSnapshotKey,
-        Body: body,
-        ContentType: "application/json; charset=utf-8",
-        CacheControl: "no-store",
-      })
-    );
+    // Store raw project JSON ONLY (critical)
+    await putJson(masterSnapshotKey, project);
+    await putJson(snapshotKey, project);
+    await putJson(latestKey, project);
 
-    // 2) Update Publisher snapshot (auto-fill key)
-    await s3.send(
-      new PutObjectCommand({
-        Bucket: S3_BUCKET,
-        Key: producerLatestKey,
-        Body: body,
-        ContentType: "application/json; charset=utf-8",
-        CacheControl: "no-store",
-      })
-    );
+    // Keep a small pointer doc for legacy callers that look up latest snapshot key
+    await putJson(latestMetaKey, {
+      projectId: pid,
+      latestSnapshotKey: snapshotKey,
+      lastMasterSaveAt: now,
+    });
 
     return res.json({
       ok: true,
-      snapshotKey: producerLatestKey, // ✅ Publisher uses this
-      latestKey: producerLatestKey,   // keep same for simplicity
-      masterSnapshotKey,              // debug/history pointer (optional)
+      snapshotKey,      // ✅ Publisher expects producer_returns snapshot key
+      latestKey,        // ✅ keep same family for simplicity
+      masterSnapshotKey // ✅ history/debug
     });
   } catch (err) {
     console.error("master-save error", err);
-    return res
-      .status(500)
-      .json({ ok: false, error: String(err?.message || err) });
+    return res.status(500).json({ ok: false, error: String(err?.message || err) });
   }
 });
 
@@ -219,13 +255,11 @@ app.post("/api/upload-to-s3", upload.single("file"), async (req, res) => {
       projectId,
       s3Key: key,
       playbackUrl,
-      url: playbackUrl,
+      url: playbackUrl, // compat
     });
   } catch (err) {
     console.error("upload-to-s3 error", err);
-    return res
-      .status(500)
-      .json({ ok: false, error: String(err?.message || err) });
+    return res.status(500).json({ ok: false, error: String(err?.message || err) });
   }
 });
 
@@ -236,27 +270,114 @@ app.get("/api/playback-url", async (req, res) => {
     if (!s3KeyRaw) {
       return res.status(400).json({ ok: false, error: "MISSING_S3_KEY" });
     }
-
     const s3Key = decodeURIComponent(s3KeyRaw);
     const playbackUrl = await signS3Key(s3Key);
+    return res.json({ ok: true, s3Key, playbackUrl, url: playbackUrl });
+  } catch (err) {
+    console.error("playback-url error", err);
+    return res.status(500).json({ ok: false, error: String(err?.message || err) });
+  }
+});
+
+/* =========================================================
+   PUBLISH (minisite)
+   Smartbridge calls POST /api/publish-minisite
+   Input:
+     { projectId, snapshotKey? }
+   Behavior:
+     - resolve snapshotKey (use provided, else latest meta)
+     - read snapshot JSON from S3
+     - write a public manifest and return publicUrl
+========================================================= */
+
+app.post("/api/publish-minisite", async (req, res) => {
+  try {
+    const projectId = safeString(req.body?.projectId || req.query?.projectId);
+    if (!projectId) {
+      return res.status(400).json({ ok: false, error: "MISSING_PROJECT_ID" });
+    }
+
+    let snapshotKey = safeString(req.body?.snapshotKey);
+
+    // If missing/invalid, try legacy latest pointer
+    if (!snapshotKey || isBogusSnapshotKey(snapshotKey)) {
+      const latestMetaKey = `storage/projects/${projectId}/producer_returns/latest.json`;
+      const latest = await getJsonIfExists(latestMetaKey);
+      snapshotKey = safeString(latest?.latestSnapshotKey) || "";
+    }
+
+    if (!snapshotKey || isBogusSnapshotKey(snapshotKey)) {
+      return res.status(400).json({ ok: false, error: "SNAPSHOT_KEY_REQUIRED" });
+    }
+
+    // Load snapshot
+    let snapshotJson;
+    try {
+      snapshotJson = await readJsonFromS3Key(snapshotKey, 60);
+    } catch {
+      return res.status(404).json({ ok: false, error: "SNAPSHOT_NOT_FOUND", snapshotKey });
+    }
+
+    // Minimal sanity check (avoid publishing empty)
+    const hasAnyData =
+      typeof snapshotJson === "object" && snapshotJson && Object.keys(snapshotJson).length > 0;
+    if (!hasAnyData) {
+      return res.status(400).json({ ok: false, error: "SNAPSHOT_EMPTY", snapshotKey });
+    }
+
+    const shareId = randHex(12);
+    const publishedKey = `public/publish/${shareId}.json`;
+
+    const manifest = {
+      ok: true,
+      shareId,
+      projectId,
+      snapshotKey,
+      createdAt: new Date().toISOString(),
+      // Keep payload minimal; clients can fetch this manifest then use snapshotKey if needed
+      snapshot: snapshotJson,
+    };
+
+    await putJson(publishedKey, manifest);
 
     return res.json({
       ok: true,
-      s3Key,
-      playbackUrl,
-      url: playbackUrl,
+      shareId,
+      snapshotKey,
+      publicKey: publishedKey,
+      publicUrl: `${req.protocol}://${req.get("host")}/publish/${shareId}.json`,
     });
   } catch (err) {
-    console.error("playback-url error", err);
-    return res
-      .status(500)
-      .json({ ok: false, error: String(err?.message || err) });
+    console.error("publish-minisite error", err);
+    return res.status(500).json({ ok: false, error: String(err?.message || err) });
+  }
+});
+
+// Public publish fetch
+app.get("/publish/:shareId.json", async (req, res) => {
+  try {
+    const shareId = safeString(req.params?.shareId);
+    if (!shareId) return res.status(400).json({ ok: false, error: "MISSING_SHARE_ID" });
+
+    const key = `public/publish/${shareId}.json`;
+
+    let json;
+    try {
+      json = await readJsonFromS3Key(key, 60);
+    } catch {
+      return res.status(404).json({ ok: false, error: "PUBLISH_NOT_FOUND", shareId });
+    }
+
+    return res.json(json);
+  } catch (err) {
+    console.error("publish-get error", err);
+    return res.status(500).json({ ok: false, error: String(err?.message || err) });
   }
 });
 
 // ---- root ----
 app.get("/", (_req, res) => {
-  res.type("text").send("album-backend OK. Try /api/health");
+  res.type("text").send("album-backend OK. Try /api/health or /publish/<shareId>.json");
 });
 
 const PORT = process.env.PORT || 3000;
