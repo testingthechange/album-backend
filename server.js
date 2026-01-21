@@ -95,9 +95,9 @@ app.get("/api/health", (_req, res) => {
 });
 
 /* =========================================================
-   MASTER SAVE (FIXED)
-   - API response: { ok:true, snapshotKey, latestKey }
-   - S3 object content: PROJECT JSON ONLY (back-compat for Album/Catalog)
+   MASTER SAVE (PUBLISHER + ALBUM COMPAT)
+   - S3 content: PROJECT JSON ONLY (Album/Catalog compat)
+   - Returns snapshotKey that Publisher expects (producer_returns)
 ========================================================= */
 
 app.post("/api/master-save", async (req, res) => {
@@ -120,35 +120,45 @@ app.post("/api/master-save", async (req, res) => {
     const stamp = isoStamp();
     const nonce = randHex(8);
 
-    const snapshotKey = `storage/projects/${projectId}/master_saves/snapshots/${stamp}__${nonce}.json`;
-    const latestKey = `storage/projects/${projectId}/master_saves/latest.json`;
+    // History (Album/Catalog)
+    const masterSnapshotKey =
+      `storage/projects/${projectId}/master_saves/snapshots/${stamp}__${nonce}.json`;
 
-    // ✅ Critical: store the raw project JSON (not a wrapper)
+    // Canonical for Publisher (Smartbridge Export/Tools expects producer_returns)
+    const producerLatestKey =
+      `storage/projects/${projectId}/producer_returns/snapshots/latest.json`;
+
+    // ✅ Critical: store raw project JSON (not wrapper)
     const body = Buffer.from(JSON.stringify(project));
 
-    // 1) Write snapshot
+    // 1) Write history snapshot
     await s3.send(
       new PutObjectCommand({
         Bucket: S3_BUCKET,
-        Key: snapshotKey,
+        Key: masterSnapshotKey,
         Body: body,
         ContentType: "application/json; charset=utf-8",
         CacheControl: "no-store",
       })
     );
 
-    // 2) Write latest (same content; avoids CopyObject quirks)
+    // 2) Update Publisher snapshot (auto-fill key)
     await s3.send(
       new PutObjectCommand({
         Bucket: S3_BUCKET,
-        Key: latestKey,
+        Key: producerLatestKey,
         Body: body,
         ContentType: "application/json; charset=utf-8",
         CacheControl: "no-store",
       })
     );
 
-    return res.json({ ok: true, snapshotKey, latestKey });
+    return res.json({
+      ok: true,
+      snapshotKey: producerLatestKey, // ✅ Publisher uses this
+      latestKey: producerLatestKey,   // keep same for simplicity
+      masterSnapshotKey,              // debug/history pointer (optional)
+    });
   } catch (err) {
     console.error("master-save error", err);
     return res
@@ -188,7 +198,9 @@ app.post("/api/upload-to-s3", upload.single("file"), async (req, res) => {
         .replace(/[^a-zA-Z0-9_-]/g, "")
         .slice(0, 24) || "album";
 
-    const key = `storage/projects/${projectId}/catalog/uploads/${songId}/${kind}/${isoStamp()}__${base}${ext}`;
+    const key =
+      `storage/projects/${projectId}/catalog/uploads/${songId}/${kind}` +
+      `/${isoStamp()}__${base}${ext}`;
 
     await s3.send(
       new PutObjectCommand({
