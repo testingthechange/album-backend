@@ -38,7 +38,10 @@ const s3 = new S3Client({
   region: AWS_REGION,
   credentials:
     AWS_ACCESS_KEY_ID && AWS_SECRET_ACCESS_KEY
-      ? { accessKeyId: AWS_ACCESS_KEY_ID, secretAccessKey: AWS_SECRET_ACCESS_KEY }
+      ? {
+          accessKeyId: AWS_ACCESS_KEY_ID,
+          secretAccessKey: AWS_SECRET_ACCESS_KEY,
+        }
       : undefined,
 });
 
@@ -76,6 +79,7 @@ function safeString(v) {
 function isBogusSnapshotKey(k) {
   const s = safeString(k);
   if (!s) return true;
+  // Legacy short keys from older Smartbridge UI (not real S3 keys)
   if (s.startsWith("masterSnapshot_")) return true;
   if (!s.includes("/") || !s.endsWith(".json")) return true;
   return false;
@@ -272,6 +276,8 @@ app.get("/api/playback-url", async (req, res) => {
    Body:
      { projectId, snapshotKey? }
    Resolves snapshotKey if omitted via producer_returns/latest.json
+   AUTO-FIX:
+     If UI sends legacy masterSnapshot_* token, ignore it and resolve latest.
 ========================================================= */
 
 app.post("/api/publish-minisite", async (req, res) => {
@@ -282,6 +288,12 @@ app.post("/api/publish-minisite", async (req, res) => {
     }
 
     let snapshotKey = safeString(req.body?.snapshotKey);
+
+    // AUTO-FIX: UI sometimes sends legacy short keys like "masterSnapshot_<id>_<ts>"
+    // Treat those as "not provided" and resolve from producer_returns/latest.json
+    if (snapshotKey && snapshotKey.startsWith("masterSnapshot_")) {
+      snapshotKey = "";
+    }
 
     if (!snapshotKey || isBogusSnapshotKey(snapshotKey)) {
       const latestMetaKey = `storage/projects/${projectId}/producer_returns/latest.json`;
@@ -300,7 +312,11 @@ app.post("/api/publish-minisite", async (req, res) => {
       return res.status(404).json({ ok: false, error: "SNAPSHOT_NOT_FOUND", snapshotKey });
     }
 
-    if (!snapshotJson || typeof snapshotJson !== "object" || Object.keys(snapshotJson).length === 0) {
+    if (
+      !snapshotJson ||
+      typeof snapshotJson !== "object" ||
+      Object.keys(snapshotJson).length === 0
+    ) {
       return res.status(400).json({ ok: false, error: "SNAPSHOT_EMPTY", snapshotKey });
     }
 
