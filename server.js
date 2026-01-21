@@ -3,6 +3,7 @@ import express from "express";
 import cors from "cors";
 import multer from "multer";
 import crypto from "crypto";
+import path from "path";
 
 import {
   S3Client,
@@ -49,6 +50,7 @@ const s3 = new S3Client({
 const ALLOWED_ORIGINS = [
   "https://smartbridge2.onrender.com",
   "https://betablocker.onrender.com",
+  "https://webshell-tm0u.onrender.com",
   "http://localhost:5173",
   "http://localhost:4173",
 ];
@@ -102,10 +104,114 @@ async function readJsonFromS3Key(key, expiresInSec = 60) {
   return r.json();
 }
 
+async function signS3Key(key, expiresInSec = 60 * 20) {
+  await s3.send(new HeadObjectCommand({ Bucket: S3_BUCKET, Key: key }));
+  return getSignedUrl(
+    s3,
+    new GetObjectCommand({ Bucket: S3_BUCKET, Key: key }),
+    { expiresIn: expiresInSec }
+  );
+}
+
 // ---- health ----
 app.get("/api/health", (_req, res) => {
   res.json({ ok: true, service: "album-backend" });
 });
+
+/* =========================================================
+   LEGACY SHIMS (Smartbridge expects these)
+   - POST /api/upload-to-s3?projectId=...
+   - GET  /api/playback-url?s3Key=...
+========================================================= */
+
+// Smartbridge upload shim
+// Expects multipart/form-data with file field "file"
+// Returns: { ok:true, projectId, s3Key, playbackUrl }
+app.post("/api/upload-to-s3", upload.single("file"), async (req, res) => {
+  try {
+    const projectId = safeString(req.query?.projectId || req.body?.projectId);
+    if (!projectId) {
+      return res.status(400).json({ ok: false, error: "MISSING_PROJECT_ID" });
+    }
+
+    const file = req.file;
+    if (!file || !file.buffer) {
+      return res.status(400).json({ ok: false, error: "MISSING_FILE" });
+    }
+
+    const original = safeString(file.originalname || "upload.bin");
+    const ext = path.extname(original) || "";
+    const base = original.replace(ext, "").replace(/\s+/g, "_").slice(0, 80);
+
+    // If Smartbridge sends song slot or id, keep it; otherwise default song_1
+    const songId =
+      safeString(req.query?.songId || req.body?.songId || req.query?.slot || "")
+        .replace(/[^a-zA-Z0-9_-]/g, "")
+        .slice(0, 32) || "song_1";
+
+    // If Smartbridge sends "kind" (album/preview/etc) keep it; default "album"
+    const kind =
+      safeString(req.query?.kind || req.body?.kind || "album")
+        .replace(/[^a-zA-Z0-9_-]/g, "")
+        .slice(0, 24) || "album";
+
+    const key = `storage/projects/${projectId}/catalog/uploads/${songId}/${kind}/${isoStamp()}__${base}${ext}`;
+
+    const contentType =
+      safeString(file.mimetype) || "application/octet-stream";
+
+    await s3.send(
+      new PutObjectCommand({
+        Bucket: S3_BUCKET,
+        Key: key,
+        Body: file.buffer,
+        ContentType: contentType,
+        CacheControl: "no-store",
+      })
+    );
+
+    const playbackUrl = await signS3Key(key, 60 * 20);
+
+    return res.json({
+      ok: true,
+      projectId,
+      s3Key: key,
+      playbackUrl,
+    });
+  } catch (err) {
+    console.error("upload-to-s3 error", err);
+    return res
+      .status(500)
+      .json({ ok: false, error: String(err?.message || err) });
+  }
+});
+
+// Smartbridge playback shim
+// GET /api/playback-url?s3Key=storage/projects/.../file.mp3
+app.get("/api/playback-url", async (req, res) => {
+  try {
+    const s3KeyRaw = safeString(req.query?.s3Key || "");
+    if (!s3KeyRaw) {
+      return res.status(400).json({ ok: false, error: "MISSING_S3_KEY" });
+    }
+
+    const s3Key = decodeURIComponent(s3KeyRaw);
+    const playbackUrl = await signS3Key(s3Key, 60 * 20);
+
+    return res.json({ ok: true, s3Key, playbackUrl });
+  } catch (err) {
+    const msg = String(err?.message || err);
+    if (msg.includes("NotFound") || msg.includes("404")) {
+      return res.status(404).json({ ok: false, error: "S3_OBJECT_NOT_FOUND" });
+    }
+    console.error("playback-url error", err);
+    return res.status(500).json({ ok: false, error: msg });
+  }
+});
+
+/* =========================================================
+   EXISTING API (newer / structured)
+========================================================= */
 
 // ---- master-save (S3 JSON) ----
 // POST /api/master-save
@@ -256,12 +362,7 @@ function deriveTracksFromSnapshotData(data) {
 async function signTrackPlaybackUrl(track) {
   const s3Key = safeString(track?.s3Key);
   if (s3Key && !isHttpUrl(s3Key)) {
-    await s3.send(new HeadObjectCommand({ Bucket: S3_BUCKET, Key: s3Key }));
-    return getSignedUrl(
-      s3,
-      new GetObjectCommand({ Bucket: S3_BUCKET, Key: s3Key }),
-      { expiresIn: 60 * 20 }
-    );
+    return signS3Key(s3Key, 60 * 20);
   }
   const u = safeString(track?.playbackUrl) || safeString(track?.s3Key);
   return isHttpUrl(u) ? u : "";
@@ -277,10 +378,6 @@ function deriveAlbumMetaFromSnapshotData(data) {
   const artistName = safeString(albumMeta?.artistName) || "";
   const releaseDate = safeString(albumMeta?.releaseDate) || "";
 
-  // IMPORTANT:
-  // We treat coverUrl as either:
-  // - an s3Key (preferred, e.g. "storage/projects/.../file.png")
-  // - OR an http(s) url (legacy)
   const coverUrl =
     safeString(albumCover?.s3Key) ||
     safeString(albumCover?.previewUrl) ||
@@ -333,7 +430,8 @@ app.post("/api/publish-minisite", async (req, res) => {
         .json({ ok: false, error: "SNAPSHOT_MISSING_DATA", snapshotKey });
     }
 
-    const createdAt = safeString(snapshot?.createdAt) || new Date().toISOString();
+    const createdAt =
+      safeString(snapshot?.createdAt) || new Date().toISOString();
     const shareId = `share_${isoStamp()}_${crypto
       .randomBytes(3)
       .toString("hex")}`;
@@ -341,17 +439,12 @@ app.post("/api/publish-minisite", async (req, res) => {
     const { albumTitle, meta, coverUrl } = deriveAlbumMetaFromSnapshotData(data);
 
     // ---- COPY COVER INTO PUBLIC PLAYER ----
-    // We publish cover to:
-    // public/players/<shareId>/cover.png
-    // Then manifest.coverUrl points to the public S3 URL.
     const publicCoverKey = `public/players/${shareId}/cover.png`;
     const publicCoverUrl = `https://${S3_BUCKET}.s3.${AWS_REGION}.amazonaws.com/${publicCoverKey}`;
 
     if (coverUrl && !isHttpUrl(coverUrl)) {
-      // coverUrl is an S3 key
       const sourceKey = coverUrl;
 
-      // ensure source exists
       await s3.send(
         new HeadObjectCommand({
           Bucket: S3_BUCKET,
@@ -368,10 +461,6 @@ app.post("/api/publish-minisite", async (req, res) => {
           CacheControl: "public, max-age=31536000, immutable",
         })
       );
-    } else {
-      // Legacy: coverUrl is http(s) or missing. We do NOT attempt remote fetch here.
-      // The manifest will still carry coverUrl (may be blank), and UI should handle fallback.
-      // If you want legacy http->s3 fetch, add it explicitly later.
     }
 
     const tracksRaw = deriveTracksFromSnapshotData(data);
@@ -393,7 +482,6 @@ app.post("/api/publish-minisite", async (req, res) => {
       snapshotKey,
       albumTitle,
       meta,
-      // Prefer public S3 cover URL if we published it; otherwise fall back to existing
       coverUrl: coverUrl && !isHttpUrl(coverUrl) ? publicCoverUrl : coverUrl,
       tracks: tracks.filter((t) => t && t.slot),
     };
@@ -421,7 +509,9 @@ app.post("/api/publish-minisite", async (req, res) => {
     });
   } catch (err) {
     console.error("publish-minisite error", err);
-    return res.status(500).json({ ok: false, error: String(err?.message || err) });
+    return res
+      .status(500)
+      .json({ ok: false, error: String(err?.message || err) });
   }
 });
 
@@ -453,82 +543,12 @@ app.get("/publish/:shareId.json", async (req, res) => {
     return res.status(404).json({ ok: false, error: "MANIFEST_NOT_FOUND" });
   }
 });
-// ---- legacy upload shim ----
-// Smartbridge minisite expects:
-// POST /api/upload-to-s3?projectId=739813
-// multipart/form-data with field "file"
-// Optional query params:
-// - kind=cover|song (default song)
-// - slot=1..9 (for songs; default 1)
-// - variant=album|a|b (default album)
-app.post("/api/upload-to-s3", upload.single("file"), async (req, res) => {
-  try {
-    const projectId = safeString(req.query?.projectId);
-    if (!projectId) {
-      return res.status(400).json({ ok: false, error: "MISSING_PROJECT_ID" });
-    }
-
-    const f = req.file;
-    if (!f || !f.buffer) {
-      return res.status(400).json({ ok: false, error: "MISSING_FILE" });
-    }
-
-    const kind = safeString(req.query?.kind || "song").toLowerCase(); // "cover" or "song"
-    const variant = safeString(req.query?.variant || "album").toLowerCase(); // album|a|b
-    const slot = Math.min(9, Math.max(1, safeNum(req.query?.slot || 1)));
-
-    const ts = isoStamp();
-
-    // keep filename stable-ish
-    const originalName = safeString(f.originalname || "upload.bin")
-      .replace(/\s+/g, "_")
-      .replace(/[^\w.\-]/g, "_");
-
-    let s3Key = "";
-    if (kind === "cover") {
-      s3Key = `storage/projects/${projectId}/catalog/uploads/song_cover/${variant}/${ts}__${originalName}`;
-    } else {
-      s3Key = `storage/projects/${projectId}/catalog/uploads/song_${slot}/${variant}/${ts}__${originalName}`;
-    }
-
-    await s3.send(
-      new PutObjectCommand({
-        Bucket: S3_BUCKET,
-        Key: s3Key,
-        Body: f.buffer,
-        ContentType: f.mimetype || "application/octet-stream",
-        CacheControl: "no-store",
-      })
-    );
-
-    // Return a direct URL (public only if bucket policy allows; otherwise still useful as reference)
-    const publicUrl = `https://${S3_BUCKET}.s3.${AWS_REGION}.amazonaws.com/${s3Key}`;
-
-    // Also return a signed GET url (works regardless of bucket public settings)
-    const signedUrl = await getSignedUrl(
-      s3,
-      new GetObjectCommand({ Bucket: S3_BUCKET, Key: s3Key }),
-      { expiresIn: 60 * 20 }
-    );
-
-    // Maintain old naming expectations:
-    // - For cover: previewUrl
-    // - For audio: playbackUrl
-    const payload =
-      kind === "cover"
-        ? { ok: true, projectId, kind, s3Key, publicUrl, previewUrl: signedUrl }
-        : { ok: true, projectId, kind, slot, variant, s3Key, publicUrl, playbackUrl: signedUrl };
-
-    return res.json(payload);
-  } catch (err) {
-    console.error("upload-to-s3 error", err);
-    return res.status(500).json({ ok: false, error: String(err?.message || err) });
-  }
-});
 
 // root
 app.get("/", (_req, res) => {
-  res.type("text").send("album-backend OK. Try /api/health or /publish/<shareId>.json");
+  res
+    .type("text")
+    .send("album-backend OK. Try /api/health or /publish/<shareId>.json");
 });
 
 const PORT = process.env.PORT || 3000;
