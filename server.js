@@ -453,6 +453,78 @@ app.get("/publish/:shareId.json", async (req, res) => {
     return res.status(404).json({ ok: false, error: "MANIFEST_NOT_FOUND" });
   }
 });
+// ---- legacy upload shim ----
+// Smartbridge minisite expects:
+// POST /api/upload-to-s3?projectId=739813
+// multipart/form-data with field "file"
+// Optional query params:
+// - kind=cover|song (default song)
+// - slot=1..9 (for songs; default 1)
+// - variant=album|a|b (default album)
+app.post("/api/upload-to-s3", upload.single("file"), async (req, res) => {
+  try {
+    const projectId = safeString(req.query?.projectId);
+    if (!projectId) {
+      return res.status(400).json({ ok: false, error: "MISSING_PROJECT_ID" });
+    }
+
+    const f = req.file;
+    if (!f || !f.buffer) {
+      return res.status(400).json({ ok: false, error: "MISSING_FILE" });
+    }
+
+    const kind = safeString(req.query?.kind || "song").toLowerCase(); // "cover" or "song"
+    const variant = safeString(req.query?.variant || "album").toLowerCase(); // album|a|b
+    const slot = Math.min(9, Math.max(1, safeNum(req.query?.slot || 1)));
+
+    const ts = isoStamp();
+
+    // keep filename stable-ish
+    const originalName = safeString(f.originalname || "upload.bin")
+      .replace(/\s+/g, "_")
+      .replace(/[^\w.\-]/g, "_");
+
+    let s3Key = "";
+    if (kind === "cover") {
+      s3Key = `storage/projects/${projectId}/catalog/uploads/song_cover/${variant}/${ts}__${originalName}`;
+    } else {
+      s3Key = `storage/projects/${projectId}/catalog/uploads/song_${slot}/${variant}/${ts}__${originalName}`;
+    }
+
+    await s3.send(
+      new PutObjectCommand({
+        Bucket: S3_BUCKET,
+        Key: s3Key,
+        Body: f.buffer,
+        ContentType: f.mimetype || "application/octet-stream",
+        CacheControl: "no-store",
+      })
+    );
+
+    // Return a direct URL (public only if bucket policy allows; otherwise still useful as reference)
+    const publicUrl = `https://${S3_BUCKET}.s3.${AWS_REGION}.amazonaws.com/${s3Key}`;
+
+    // Also return a signed GET url (works regardless of bucket public settings)
+    const signedUrl = await getSignedUrl(
+      s3,
+      new GetObjectCommand({ Bucket: S3_BUCKET, Key: s3Key }),
+      { expiresIn: 60 * 20 }
+    );
+
+    // Maintain old naming expectations:
+    // - For cover: previewUrl
+    // - For audio: playbackUrl
+    const payload =
+      kind === "cover"
+        ? { ok: true, projectId, kind, s3Key, publicUrl, previewUrl: signedUrl }
+        : { ok: true, projectId, kind, slot, variant, s3Key, publicUrl, playbackUrl: signedUrl };
+
+    return res.json(payload);
+  } catch (err) {
+    console.error("upload-to-s3 error", err);
+    return res.status(500).json({ ok: false, error: String(err?.message || err) });
+  }
+});
 
 // root
 app.get("/", (_req, res) => {
