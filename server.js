@@ -10,7 +10,6 @@ import {
   PutObjectCommand,
   GetObjectCommand,
   HeadObjectCommand,
-  CopyObjectCommand,
 } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 
@@ -77,33 +76,8 @@ function isoStamp() {
 function safeString(v) {
   return String(v ?? "").trim();
 }
-function safeNum(v) {
-  const n = Number(v);
-  return Number.isFinite(n) ? n : 0;
-}
-function isHttpUrl(s) {
-  return /^https?:\/\//i.test(String(s || ""));
-}
-function isBogusSnapshotKey(k) {
-  const s = safeString(k);
-  if (!s) return true;
-  if (s.startsWith("masterSnapshot_")) return true;
-  if (!s.includes("/") || !s.endsWith(".json")) return true;
-  return false;
-}
 function randHex(bytes = 8) {
   return crypto.randomBytes(bytes).toString("hex");
-}
-
-async function readJsonFromS3Key(key, expiresInSec = 60) {
-  const url = await getSignedUrl(
-    s3,
-    new GetObjectCommand({ Bucket: S3_BUCKET, Key: key }),
-    { expiresIn: expiresInSec }
-  );
-  const r = await fetch(url);
-  if (!r.ok) throw new Error(`HTTP ${r.status}`);
-  return r.json();
 }
 
 async function signS3Key(key, expiresInSec = 60 * 20) {
@@ -121,10 +95,9 @@ app.get("/api/health", (_req, res) => {
 });
 
 /* =========================================================
-   MASTER SAVE (FIX)
-   Expected:
-     HTTP 200
-     { ok:true, snapshotKey, latestKey }
+   MASTER SAVE (FIXED)
+   - API response: { ok:true, snapshotKey, latestKey }
+   - S3 object content: PROJECT JSON ONLY (back-compat for Album/Catalog)
 ========================================================= */
 
 app.post("/api/master-save", async (req, res) => {
@@ -136,10 +109,10 @@ app.post("/api/master-save", async (req, res) => {
       return res.status(400).json({ ok: false, error: "MISSING_PROJECT_ID" });
     }
     if (project == null || typeof project !== "object") {
-      return res.status(400).json({ ok: false, error: "MISSING_PROJECT_OBJECT" });
+      return res
+        .status(400)
+        .json({ ok: false, error: "MISSING_PROJECT_OBJECT" });
     }
-
-    // Require S3 env to be present for real saves
     if (!AWS_REGION || !S3_BUCKET) {
       return res.status(500).json({ ok: false, error: "S3_NOT_CONFIGURED" });
     }
@@ -147,39 +120,31 @@ app.post("/api/master-save", async (req, res) => {
     const stamp = isoStamp();
     const nonce = randHex(8);
 
-    // Keep paths stable and easy to reason about
     const snapshotKey = `storage/projects/${projectId}/master_saves/snapshots/${stamp}__${nonce}.json`;
     const latestKey = `storage/projects/${projectId}/master_saves/latest.json`;
 
-    const payload = {
-      ok: true,
-      projectId,
-      createdAt: new Date().toISOString(),
-      snapshotKey,
-      latestKey,
-      project,
-    };
+    // ✅ Critical: store the raw project JSON (not a wrapper)
+    const body = Buffer.from(JSON.stringify(project));
 
     // 1) Write snapshot
     await s3.send(
       new PutObjectCommand({
         Bucket: S3_BUCKET,
         Key: snapshotKey,
-        Body: Buffer.from(JSON.stringify(payload)),
+        Body: body,
         ContentType: "application/json; charset=utf-8",
         CacheControl: "no-store",
       })
     );
 
-    // 2) Update latest (copy snapshot -> latest)
+    // 2) Write latest (same content; avoids CopyObject quirks)
     await s3.send(
-      new CopyObjectCommand({
+      new PutObjectCommand({
         Bucket: S3_BUCKET,
         Key: latestKey,
-        CopySource: `${S3_BUCKET}/${snapshotKey}`,
+        Body: body,
         ContentType: "application/json; charset=utf-8",
         CacheControl: "no-store",
-        MetadataDirective: "REPLACE",
       })
     );
 
@@ -242,7 +207,7 @@ app.post("/api/upload-to-s3", upload.single("file"), async (req, res) => {
       projectId,
       s3Key: key,
       playbackUrl,
-      url: playbackUrl, // ✅ COMPAT (Smartbridge)
+      url: playbackUrl,
     });
   } catch (err) {
     console.error("upload-to-s3 error", err);
@@ -267,7 +232,7 @@ app.get("/api/playback-url", async (req, res) => {
       ok: true,
       s3Key,
       playbackUrl,
-      url: playbackUrl, // ✅ COMPAT (Smartbridge)
+      url: playbackUrl,
     });
   } catch (err) {
     console.error("playback-url error", err);
