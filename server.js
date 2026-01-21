@@ -38,10 +38,7 @@ const s3 = new S3Client({
   region: AWS_REGION,
   credentials:
     AWS_ACCESS_KEY_ID && AWS_SECRET_ACCESS_KEY
-      ? {
-          accessKeyId: AWS_ACCESS_KEY_ID,
-          secretAccessKey: AWS_SECRET_ACCESS_KEY,
-        }
+      ? { accessKeyId: AWS_ACCESS_KEY_ID, secretAccessKey: AWS_SECRET_ACCESS_KEY }
       : undefined,
 });
 
@@ -75,10 +72,6 @@ function isoStamp() {
 }
 function safeString(v) {
   return String(v ?? "").trim();
-}
-function safeNum(v) {
-  const n = Number(v);
-  return Number.isFinite(n) ? n : 0;
 }
 function isBogusSnapshotKey(k) {
   const s = safeString(k);
@@ -138,13 +131,10 @@ app.get("/api/health", (_req, res) => {
 
 /* =========================================================
    MASTER SAVE (UPDATED)
-   Goals:
-   - Store PROJECT JSON ONLY in S3 snapshots (Album/Catalog compat)
-   - Maintain legacy Publisher flow (producer_returns snapshot + latest.json)
-   - Maintain master_saves history (for Album pipeline)
+   - Writes PROJECT JSON ONLY (Album/Catalog compat)
+   - Writes Publisher-compatible producer_returns snapshot + latest pointer
    Returns:
      { ok:true, snapshotKey, latestKey, masterSnapshotKey }
-   Where snapshotKey/latestKey are producer_returns (Publisher expects that).
 ========================================================= */
 
 app.post("/api/master-save", async (req, res) => {
@@ -164,27 +154,24 @@ app.post("/api/master-save", async (req, res) => {
     const nonce = randHex(6);
     const now = new Date().toISOString();
 
-    // 1) Album/Catalog history (new)
+    // History for Album/Catalog pipeline
     const masterSnapshotKey =
       `storage/projects/${pid}/master_saves/snapshots/${ts}__${nonce}.json`;
 
-    // 2) Publisher canonical snapshot (legacy expectation)
-    //    This is the "short version" key Publisher wants to already have.
+    // Publisher canonical snapshot family (Smartbridge Export/Tools)
     const snapshotKey =
       `storage/projects/${pid}/producer_returns/snapshots/${ts}.json`;
     const latestKey =
       `storage/projects/${pid}/producer_returns/snapshots/latest.json`;
-
-    // 3) Producer returns "latest pointer" metadata (legacy)
     const latestMetaKey =
       `storage/projects/${pid}/producer_returns/latest.json`;
 
-    // Store raw project JSON ONLY (critical)
+    // Store raw project JSON ONLY
     await putJson(masterSnapshotKey, project);
     await putJson(snapshotKey, project);
     await putJson(latestKey, project);
 
-    // Keep a small pointer doc for legacy callers that look up latest snapshot key
+    // Pointer doc used by publisher when snapshotKey is omitted
     await putJson(latestMetaKey, {
       projectId: pid,
       latestSnapshotKey: snapshotKey,
@@ -193,9 +180,9 @@ app.post("/api/master-save", async (req, res) => {
 
     return res.json({
       ok: true,
-      snapshotKey,      // ✅ Publisher expects producer_returns snapshot key
-      latestKey,        // ✅ keep same family for simplicity
-      masterSnapshotKey // ✅ history/debug
+      snapshotKey,
+      latestKey,
+      masterSnapshotKey,
     });
   } catch (err) {
     console.error("master-save error", err);
@@ -255,7 +242,7 @@ app.post("/api/upload-to-s3", upload.single("file"), async (req, res) => {
       projectId,
       s3Key: key,
       playbackUrl,
-      url: playbackUrl, // compat
+      url: playbackUrl,
     });
   } catch (err) {
     console.error("upload-to-s3 error", err);
@@ -281,13 +268,10 @@ app.get("/api/playback-url", async (req, res) => {
 
 /* =========================================================
    PUBLISH (minisite)
-   Smartbridge calls POST /api/publish-minisite
-   Input:
+   POST /api/publish-minisite
+   Body:
      { projectId, snapshotKey? }
-   Behavior:
-     - resolve snapshotKey (use provided, else latest meta)
-     - read snapshot JSON from S3
-     - write a public manifest and return publicUrl
+   Resolves snapshotKey if omitted via producer_returns/latest.json
 ========================================================= */
 
 app.post("/api/publish-minisite", async (req, res) => {
@@ -299,7 +283,6 @@ app.post("/api/publish-minisite", async (req, res) => {
 
     let snapshotKey = safeString(req.body?.snapshotKey);
 
-    // If missing/invalid, try legacy latest pointer
     if (!snapshotKey || isBogusSnapshotKey(snapshotKey)) {
       const latestMetaKey = `storage/projects/${projectId}/producer_returns/latest.json`;
       const latest = await getJsonIfExists(latestMetaKey);
@@ -310,7 +293,6 @@ app.post("/api/publish-minisite", async (req, res) => {
       return res.status(400).json({ ok: false, error: "SNAPSHOT_KEY_REQUIRED" });
     }
 
-    // Load snapshot
     let snapshotJson;
     try {
       snapshotJson = await readJsonFromS3Key(snapshotKey, 60);
@@ -318,15 +300,12 @@ app.post("/api/publish-minisite", async (req, res) => {
       return res.status(404).json({ ok: false, error: "SNAPSHOT_NOT_FOUND", snapshotKey });
     }
 
-    // Minimal sanity check (avoid publishing empty)
-    const hasAnyData =
-      typeof snapshotJson === "object" && snapshotJson && Object.keys(snapshotJson).length > 0;
-    if (!hasAnyData) {
+    if (!snapshotJson || typeof snapshotJson !== "object" || Object.keys(snapshotJson).length === 0) {
       return res.status(400).json({ ok: false, error: "SNAPSHOT_EMPTY", snapshotKey });
     }
 
     const shareId = randHex(12);
-    const publishedKey = `public/publish/${shareId}.json`;
+    const publicKey = `public/publish/${shareId}.json`;
 
     const manifest = {
       ok: true,
@@ -334,17 +313,16 @@ app.post("/api/publish-minisite", async (req, res) => {
       projectId,
       snapshotKey,
       createdAt: new Date().toISOString(),
-      // Keep payload minimal; clients can fetch this manifest then use snapshotKey if needed
       snapshot: snapshotJson,
     };
 
-    await putJson(publishedKey, manifest);
+    await putJson(publicKey, manifest);
 
     return res.json({
       ok: true,
       shareId,
       snapshotKey,
-      publicKey: publishedKey,
+      publicKey,
       publicUrl: `${req.protocol}://${req.get("host")}/publish/${shareId}.json`,
     });
   } catch (err) {
@@ -353,7 +331,6 @@ app.post("/api/publish-minisite", async (req, res) => {
   }
 });
 
-// Public publish fetch
 app.get("/publish/:shareId.json", async (req, res) => {
   try {
     const shareId = safeString(req.params?.shareId);
