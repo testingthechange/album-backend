@@ -16,93 +16,52 @@ import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 const app = express();
 app.set("trust proxy", 1);
 
-process.on("uncaughtException", (err) => {
-  console.error("UNCAUGHT_EXCEPTION", err);
-  process.exit(1);
-});
-process.on("unhandledRejection", (reason) => {
-  console.error("UNHANDLED_REJECTION", reason);
-  process.exit(1);
-});
-
 const upload = multer({ storage: multer.memoryStorage() });
 
-// ---- env ----
+// ---------- env ----------
 const { AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION, S3_BUCKET } =
   process.env;
-
-if (!AWS_REGION) console.error("Missing required env var: AWS_REGION");
-if (!S3_BUCKET) console.error("Missing required env var: S3_BUCKET");
 
 const s3 = new S3Client({
   region: AWS_REGION,
   credentials:
     AWS_ACCESS_KEY_ID && AWS_SECRET_ACCESS_KEY
-      ? {
-          accessKeyId: AWS_ACCESS_KEY_ID,
-          secretAccessKey: AWS_SECRET_ACCESS_KEY,
-        }
+      ? { accessKeyId: AWS_ACCESS_KEY_ID, secretAccessKey: AWS_SECRET_ACCESS_KEY }
       : undefined,
 });
 
-// ---- CORS ----
-const ALLOWED_ORIGINS = [
-  "https://smartbridge2.onrender.com",
-  "https://betablocker.onrender.com",
-  "https://webshell-tm0u.onrender.com",
-  "http://localhost:5173",
-  "http://localhost:4173",
-];
-
+// ---------- cors ----------
 app.use(
   cors({
-    origin: (origin, cb) => {
-      if (!origin) return cb(null, true);
-      if (ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
-      return cb(new Error(`CORS blocked origin: ${origin}`), false);
-    },
+    origin: [
+      "https://smartbridge2.onrender.com",
+      "https://betablocker.onrender.com",
+      "https://webshell-tm0u.onrender.com",
+      "http://localhost:5173",
+      "http://localhost:4173",
+    ],
     methods: ["GET", "POST", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Authorization"],
   })
 );
 
-app.options("*", cors());
 app.use(express.json({ limit: "25mb" }));
 
-// ---- helpers ----
-function isoStamp() {
-  return new Date().toISOString().replace(/[:.]/g, "-");
-}
-function safeString(v) {
-  return String(v ?? "").trim();
-}
-function isBogusSnapshotKey(k) {
-  const s = safeString(k);
-  if (!s) return true;
-  // Legacy short keys from older Smartbridge UI (not real S3 keys)
-  if (s.startsWith("masterSnapshot_")) return true;
-  if (!s.includes("/") || !s.endsWith(".json")) return true;
-  return false;
-}
-function randHex(bytes = 8) {
-  return crypto.randomBytes(bytes).toString("hex");
-}
+// ---------- helpers ----------
+const iso = () => new Date().toISOString().replace(/[:.]/g, "-");
+const safe = (v) => String(v ?? "").trim();
+const rand = (n = 12) => crypto.randomBytes(n).toString("hex");
 
-async function signS3Key(key, expiresInSec = 60 * 20) {
+async function signS3(key, expires = 1200) {
   await s3.send(new HeadObjectCommand({ Bucket: S3_BUCKET, Key: key }));
   return getSignedUrl(
     s3,
     new GetObjectCommand({ Bucket: S3_BUCKET, Key: key }),
-    { expiresIn: expiresInSec }
+    { expiresIn: expires }
   );
 }
 
-async function readJsonFromS3Key(key, expiresInSec = 60) {
-  const url = await getSignedUrl(
-    s3,
-    new GetObjectCommand({ Bucket: S3_BUCKET, Key: key }),
-    { expiresIn: expiresInSec }
-  );
+async function readJson(key) {
+  const url = await signS3(key, 60);
   const r = await fetch(url);
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
   return r.json();
@@ -114,266 +73,144 @@ async function putJson(key, obj) {
       Bucket: S3_BUCKET,
       Key: key,
       Body: Buffer.from(JSON.stringify(obj)),
-      ContentType: "application/json; charset=utf-8",
+      ContentType: "application/json",
       CacheControl: "no-store",
     })
   );
 }
 
-async function getJsonIfExists(key) {
-  try {
-    return await readJsonFromS3Key(key, 60);
-  } catch {
-    return null;
+// ---------- strip playbackUrl (CRITICAL FIX) ----------
+function stripPlaybackUrls(obj) {
+  if (Array.isArray(obj)) return obj.map(stripPlaybackUrls);
+  if (obj && typeof obj === "object") {
+    const out = {};
+    for (const [k, v] of Object.entries(obj)) {
+      if (k === "playbackUrl" || k === "url") continue;
+      out[k] = stripPlaybackUrls(v);
+    }
+    return out;
   }
+  return obj;
 }
 
-// ---- health ----
+// ---------- health ----------
 app.get("/api/health", (_req, res) => {
   res.json({ ok: true, service: "album-backend" });
 });
 
-/* =========================================================
-   MASTER SAVE (UPDATED)
-   - Writes PROJECT JSON ONLY (Album/Catalog compat)
-   - Writes Publisher-compatible producer_returns snapshot + latest pointer
-   Returns:
-     { ok:true, snapshotKey, latestKey, masterSnapshotKey }
-========================================================= */
-
-app.post("/api/master-save", async (req, res) => {
-  try {
-    const pid = safeString(req.body?.projectId);
-    const project = req.body?.project;
-
-    if (!pid) return res.status(400).json({ ok: false, error: "MISSING_PROJECT_ID" });
-    if (project == null || typeof project !== "object") {
-      return res.status(400).json({ ok: false, error: "MISSING_PROJECT_OBJECT" });
-    }
-    if (!AWS_REGION || !S3_BUCKET) {
-      return res.status(500).json({ ok: false, error: "S3_NOT_CONFIGURED" });
-    }
-
-    const ts = isoStamp();
-    const nonce = randHex(6);
-    const now = new Date().toISOString();
-
-    // History for Album/Catalog pipeline
-    const masterSnapshotKey =
-      `storage/projects/${pid}/master_saves/snapshots/${ts}__${nonce}.json`;
-
-    // Publisher canonical snapshot family (Smartbridge Export/Tools)
-    const snapshotKey =
-      `storage/projects/${pid}/producer_returns/snapshots/${ts}.json`;
-    const latestKey =
-      `storage/projects/${pid}/producer_returns/snapshots/latest.json`;
-    const latestMetaKey =
-      `storage/projects/${pid}/producer_returns/latest.json`;
-
-    // Store raw project JSON ONLY
-    await putJson(masterSnapshotKey, project);
-    await putJson(snapshotKey, project);
-    await putJson(latestKey, project);
-
-    // Pointer doc used by publisher when snapshotKey is omitted
-    await putJson(latestMetaKey, {
-      projectId: pid,
-      latestSnapshotKey: snapshotKey,
-      lastMasterSaveAt: now,
-    });
-
-    return res.json({
-      ok: true,
-      snapshotKey,
-      latestKey,
-      masterSnapshotKey,
-    });
-  } catch (err) {
-    console.error("master-save error", err);
-    return res.status(500).json({ ok: false, error: String(err?.message || err) });
-  }
-});
-
-/* =========================================================
-   LEGACY SHIMS (Smartbridge expects these)
-========================================================= */
-
-// POST /api/upload-to-s3
+// ---------- upload (editor only) ----------
 app.post("/api/upload-to-s3", upload.single("file"), async (req, res) => {
   try {
-    const projectId = safeString(req.query?.projectId || req.body?.projectId);
-    if (!projectId) {
-      return res.status(400).json({ ok: false, error: "MISSING_PROJECT_ID" });
+    const projectId = safe(req.query.projectId || req.body.projectId);
+    if (!projectId || !req.file) {
+      return res.status(400).json({ ok: false });
     }
 
-    const file = req.file;
-    if (!file || !file.buffer) {
-      return res.status(400).json({ ok: false, error: "MISSING_FILE" });
-    }
-
-    const original = safeString(file.originalname || "upload.bin");
-    const ext = path.extname(original) || "";
-    const base = original.replace(ext, "").replace(/\s+/g, "_").slice(0, 80);
-
-    const songId =
-      safeString(req.query?.songId || req.body?.songId || req.query?.slot || "")
-        .replace(/[^a-zA-Z0-9_-]/g, "")
-        .slice(0, 32) || "song_1";
-
-    const kind =
-      safeString(req.query?.kind || req.body?.kind || "album")
-        .replace(/[^a-zA-Z0-9_-]/g, "")
-        .slice(0, 24) || "album";
-
-    const key =
-      `storage/projects/${projectId}/catalog/uploads/${songId}/${kind}` +
-      `/${isoStamp()}__${base}${ext}`;
-
+    const key = `storage/projects/${projectId}/uploads/${iso()}__${req.file.originalname}`;
     await s3.send(
       new PutObjectCommand({
         Bucket: S3_BUCKET,
         Key: key,
-        Body: file.buffer,
-        ContentType: safeString(file.mimetype),
-        CacheControl: "no-store",
+        Body: req.file.buffer,
+        ContentType: req.file.mimetype,
       })
     );
 
-    const playbackUrl = await signS3Key(key);
-
-    return res.json({
-      ok: true,
-      projectId,
-      s3Key: key,
-      playbackUrl,
-      url: playbackUrl,
-    });
-  } catch (err) {
-    console.error("upload-to-s3 error", err);
-    return res.status(500).json({ ok: false, error: String(err?.message || err) });
+    const playbackUrl = await signS3(key);
+    res.json({ ok: true, s3Key: key, playbackUrl });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
   }
 });
 
-// GET /api/playback-url
+// ---------- playback (runtime) ----------
 app.get("/api/playback-url", async (req, res) => {
   try {
-    const s3KeyRaw = safeString(req.query?.s3Key || "");
-    if (!s3KeyRaw) {
-      return res.status(400).json({ ok: false, error: "MISSING_S3_KEY" });
-    }
-    const s3Key = decodeURIComponent(s3KeyRaw);
-    const playbackUrl = await signS3Key(s3Key);
-    return res.json({ ok: true, s3Key, playbackUrl, url: playbackUrl });
-  } catch (err) {
-    console.error("playback-url error", err);
-    return res.status(500).json({ ok: false, error: String(err?.message || err) });
+    const key = decodeURIComponent(safe(req.query.s3Key));
+    if (!key) return res.status(400).json({ ok: false });
+    const url = await signS3(key);
+    res.json({ ok: true, url, playbackUrl: url });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
   }
 });
 
-/* =========================================================
-   PUBLISH (minisite)
-   POST /api/publish-minisite
-   Body:
-     { projectId, snapshotKey? }
-   Resolves snapshotKey if omitted via producer_returns/latest.json
-   AUTO-FIX:
-     If UI sends legacy masterSnapshot_* token, ignore it and resolve latest.
-========================================================= */
+// ---------- master save ----------
+app.post("/api/master-save", async (req, res) => {
+  try {
+    const pid = safe(req.body.projectId);
+    const project = req.body.project;
+    if (!pid || !project) return res.status(400).json({ ok: false });
 
+    const snapKey = `storage/projects/${pid}/producer_returns/snapshots/${iso()}.json`;
+    const latestKey = `storage/projects/${pid}/producer_returns/latest.json`;
+
+    await putJson(snapKey, project);
+    await putJson(latestKey, {
+      projectId: pid,
+      latestSnapshotKey: snapKey,
+      lastMasterSaveAt: new Date().toISOString(),
+    });
+
+    res.json({ ok: true, snapshotKey: snapKey });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ---------- publish (FIXED) ----------
 app.post("/api/publish-minisite", async (req, res) => {
   try {
-    const projectId = safeString(req.body?.projectId || req.query?.projectId);
-    if (!projectId) {
-      return res.status(400).json({ ok: false, error: "MISSING_PROJECT_ID" });
+    const projectId = safe(req.body.projectId);
+    let snapshotKey = safe(req.body.snapshotKey);
+
+    if (!snapshotKey) {
+      const meta = await readJson(
+        `storage/projects/${projectId}/producer_returns/latest.json`
+      );
+      snapshotKey = meta.latestSnapshotKey;
     }
 
-    let snapshotKey = safeString(req.body?.snapshotKey);
+    const rawSnapshot = await readJson(snapshotKey);
+    const cleanSnapshot = stripPlaybackUrls(rawSnapshot);
 
-    // AUTO-FIX: UI sometimes sends legacy short keys like "masterSnapshot_<id>_<ts>"
-    // Treat those as "not provided" and resolve from producer_returns/latest.json
-    if (snapshotKey && snapshotKey.startsWith("masterSnapshot_")) {
-      snapshotKey = "";
-    }
-
-    if (!snapshotKey || isBogusSnapshotKey(snapshotKey)) {
-      const latestMetaKey = `storage/projects/${projectId}/producer_returns/latest.json`;
-      const latest = await getJsonIfExists(latestMetaKey);
-      snapshotKey = safeString(latest?.latestSnapshotKey) || "";
-    }
-
-    if (!snapshotKey || isBogusSnapshotKey(snapshotKey)) {
-      return res.status(400).json({ ok: false, error: "SNAPSHOT_KEY_REQUIRED" });
-    }
-
-    let snapshotJson;
-    try {
-      snapshotJson = await readJsonFromS3Key(snapshotKey, 60);
-    } catch {
-      return res.status(404).json({ ok: false, error: "SNAPSHOT_NOT_FOUND", snapshotKey });
-    }
-
-    if (
-      !snapshotJson ||
-      typeof snapshotJson !== "object" ||
-      Object.keys(snapshotJson).length === 0
-    ) {
-      return res.status(400).json({ ok: false, error: "SNAPSHOT_EMPTY", snapshotKey });
-    }
-
-    const shareId = randHex(12);
+    const shareId = rand(12);
     const publicKey = `public/publish/${shareId}.json`;
 
-    const manifest = {
-      ok: true,
+    await putJson(publicKey, {
       shareId,
       projectId,
       snapshotKey,
+      snapshot: cleanSnapshot,
       createdAt: new Date().toISOString(),
-      snapshot: snapshotJson,
-    };
+    });
 
-    await putJson(publicKey, manifest);
-
-    return res.json({
+    res.json({
       ok: true,
       shareId,
       snapshotKey,
-      publicKey,
       publicUrl: `${req.protocol}://${req.get("host")}/publish/${shareId}.json`,
     });
-  } catch (err) {
-    console.error("publish-minisite error", err);
-    return res.status(500).json({ ok: false, error: String(err?.message || err) });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
   }
 });
 
+// ---------- publish GET ----------
 app.get("/publish/:shareId.json", async (req, res) => {
   try {
-    const shareId = safeString(req.params?.shareId);
-    if (!shareId) return res.status(400).json({ ok: false, error: "MISSING_SHARE_ID" });
-
-    const key = `public/publish/${shareId}.json`;
-
-    let json;
-    try {
-      json = await readJsonFromS3Key(key, 60);
-    } catch {
-      return res.status(404).json({ ok: false, error: "PUBLISH_NOT_FOUND", shareId });
-    }
-
-    return res.json(json);
-  } catch (err) {
-    console.error("publish-get error", err);
-    return res.status(500).json({ ok: false, error: String(err?.message || err) });
+    const key = `public/publish/${safe(req.params.shareId)}.json`;
+    const json = await readJson(key);
+    res.json(json);
+  } catch {
+    res.status(404).json({ ok: false });
   }
 });
 
-// ---- root ----
+// ---------- root ----------
 app.get("/", (_req, res) => {
-  res.type("text").send("album-backend OK. Try /api/health or /publish/<shareId>.json");
+  res.send("album-backend OK");
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log("album-backend listening on", PORT);
-});
+app.listen(PORT, () => console.log("album-backend listening on", PORT));
