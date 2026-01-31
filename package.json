@@ -12,6 +12,7 @@
     "@aws-sdk/s3-request-presigner": "^3.758.0",
     "cors": "^2.8.5",
     "express": "^4.19.2",
-    "multer": "^2.0.2"
+    "multer": "^2.0.2",
+    "resend": "^3.2.0"
   }
 }
