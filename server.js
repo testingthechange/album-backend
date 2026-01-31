@@ -1,9 +1,9 @@
-
 // album-backend/server.js
 import express from "express";
 import cors from "cors";
 import multer from "multer";
 import crypto from "crypto";
+import { Resend } from "resend";
 
 import {
   S3Client,
@@ -25,10 +25,18 @@ const {
   AWS_REGION,
   S3_BUCKET,
   PORT,
+
+  // magic link + email
+  PUBLIC_APP_BASE_URL,
+  RESEND_API_KEY,
+  FROM_EMAIL,
 } = process.env;
 
 if (!AWS_REGION) console.warn("WARN: AWS_REGION is not set");
 if (!S3_BUCKET) console.warn("WARN: S3_BUCKET is not set");
+
+// Resend client (no SMTP needed)
+const resend = RESEND_API_KEY ? new Resend(RESEND_API_KEY) : null;
 
 // If creds are not provided, the SDK will fall back to the environment / instance role.
 // Keep this behavior but be explicit about region default.
@@ -79,10 +87,7 @@ function errString(e) {
 
 function logErr(req, e) {
   const rid = req?.headers?.["x-request-id"] || req?.headers?.["x-render-request-id"] || "";
-  console.error(
-    `ERROR ${req.method} ${req.originalUrl} requestID=${rid} ::`,
-    e?.stack || e
-  );
+  console.error(`ERROR ${req.method} ${req.originalUrl} requestID=${rid} ::`, e?.stack || e);
 }
 
 async function signS3(key, expires = 1200) {
@@ -92,11 +97,7 @@ async function signS3(key, expires = 1200) {
 
   // Head first to validate existence and produce a clearer error.
   await s3.send(new HeadObjectCommand({ Bucket: S3_BUCKET, Key }));
-  return getSignedUrl(
-    s3,
-    new GetObjectCommand({ Bucket: S3_BUCKET, Key }),
-    { expiresIn: expires }
-  );
+  return getSignedUrl(s3, new GetObjectCommand({ Bucket: S3_BUCKET, Key }), { expiresIn: expires });
 }
 
 async function readJson(key) {
@@ -125,6 +126,45 @@ async function putJson(key, obj) {
   );
 }
 
+// ---------- magic link + email (Resend) ----------
+// Minimal in-memory store: projectId -> { tokenPlain, expiresAtIso, lastSentTo, lastSentAtIso }
+const MAGIC_LINKS = new Map();
+
+function genToken() {
+  // 32 bytes => 256-bit token
+  return crypto.randomBytes(32).toString("base64url");
+}
+
+function plusDaysIso(days) {
+  const d = new Date();
+  d.setDate(d.getDate() + days);
+  return d.toISOString();
+}
+
+function getPublicBase() {
+  const base = safe(PUBLIC_APP_BASE_URL).replace(/\/+$/, "");
+  if (!base) throw new Error("PUBLIC_APP_BASE_URL_NOT_SET");
+  return base;
+}
+
+async function sendMagicLinkEmail({ to, projectId, url, expiresAt }) {
+  if (!resend) throw new Error("RESEND_API_KEY_NOT_SET");
+  if (!safe(FROM_EMAIL)) throw new Error("FROM_EMAIL_NOT_SET");
+
+  await resend.emails.send({
+    from: safe(FROM_EMAIL),
+    to,
+    subject: `Producer link — Project ${projectId}`,
+    text: `Open your project:
+
+${url}
+
+Expires: ${expiresAt}
+
+If you did not expect this email, ignore it.`,
+  });
+}
+
 // ---------- strip playbackUrl (CRITICAL FIX) ----------
 function stripPlaybackUrls(obj) {
   if (Array.isArray(obj)) return obj.map(stripPlaybackUrls);
@@ -142,6 +182,57 @@ function stripPlaybackUrls(obj) {
 // ---------- health ----------
 app.get("/api/health", (_req, res) => {
   res.json({ ok: true, service: "album-backend" });
+});
+
+// ---------- magic link: send ----------
+app.post("/api/magic-link/send", async (req, res) => {
+  try {
+    const projectId = safe(req.body?.projectId);
+    const email = safe(req.body?.email).toLowerCase();
+
+    if (!projectId) return res.status(400).json({ ok: false, error: "MISSING_projectId" });
+    if (!email || !email.includes("@")) return res.status(400).json({ ok: false, error: "MISSING_email" });
+
+    const now = new Date().toISOString();
+    const base = getPublicBase();
+
+    // Reuse active token if not expired (resend = same active link)
+    const existing = MAGIC_LINKS.get(projectId);
+    let tokenPlain = "";
+    let expiresAtIso = "";
+
+    if (existing?.tokenPlain && existing?.expiresAtIso && new Date(existing.expiresAtIso) > new Date()) {
+      tokenPlain = existing.tokenPlain;
+      expiresAtIso = existing.expiresAtIso;
+    } else {
+      tokenPlain = genToken();
+      expiresAtIso = plusDaysIso(14);
+      MAGIC_LINKS.set(projectId, {
+        tokenPlain,
+        expiresAtIso,
+        lastSentTo: "",
+        lastSentAtIso: "",
+      });
+    }
+
+    const url = `${base}/minisite/${encodeURIComponent(projectId)}/catalog?token=${encodeURIComponent(tokenPlain)}`;
+
+    await sendMagicLinkEmail({ to: email, projectId, url, expiresAt: expiresAtIso });
+
+    const row = MAGIC_LINKS.get(projectId) || {};
+    MAGIC_LINKS.set(projectId, {
+      ...row,
+      tokenPlain,
+      expiresAtIso,
+      lastSentTo: email,
+      lastSentAtIso: now,
+    });
+
+    res.json({ ok: true, projectId, email, expiresAt: expiresAtIso });
+  } catch (e) {
+    logErr(req, e);
+    res.status(500).json({ ok: false, error: errString(e) });
+  }
 });
 
 // ---------- upload (editor only) ----------
@@ -189,7 +280,9 @@ app.post("/api/master-save", async (req, res) => {
   try {
     const pid = safe(req.body?.projectId);
     const project = req.body?.project;
-    if (!pid || !project) return res.status(400).json({ ok: false, error: "MISSING_projectId_OR_project" });
+    if (!pid || !project) {
+      return res.status(400).json({ ok: false, error: "MISSING_projectId_OR_project" });
+    }
 
     const snapKey = `storage/projects/${pid}/producer_returns/snapshots/${iso()}.json`;
     const latestKey = `storage/projects/${pid}/producer_returns/latest.json`;
