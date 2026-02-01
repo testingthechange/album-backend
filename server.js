@@ -39,7 +39,6 @@ if (!S3_BUCKET) console.warn("WARN: S3_BUCKET is not set");
 const resend = RESEND_API_KEY ? new Resend(RESEND_API_KEY) : null;
 
 // If creds are not provided, the SDK will fall back to the environment / instance role.
-// Keep this behavior but be explicit about region default.
 const s3 = new S3Client({
   region: AWS_REGION || "us-east-1",
   credentials:
@@ -48,23 +47,34 @@ const s3 = new S3Client({
       : undefined,
 });
 
-// ---------- cors ----------
-app.use(
-  cors({
-    origin: [
-      "https://smartbridge2.onrender.com",
-      "https://betablocker.onrender.com",
-      "https://webshell-tm0u.onrender.com",
-      "http://localhost:5173",
-      "http://localhost:4173",
-    ],
-    methods: ["GET", "POST", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Authorization"],
-  })
-);
+// ---------- cors (FIXED: add blockone + make OPTIONS use same config) ----------
+const ALLOWED_ORIGINS = [
+  // ✅ BlockOne (new)
+  "https://blockone.onrender.com",
 
-// Make OPTIONS always quick/clean.
-app.options("*", cors());
+  // previous sites
+  "https://smartbridge2.onrender.com",
+  "https://betablocker.onrender.com",
+  "https://webshell-tm0u.onrender.com",
+
+  // local dev
+  "http://localhost:5173",
+  "http://localhost:4173",
+];
+
+const corsOptions = {
+  origin(origin, cb) {
+    // allow non-browser calls (curl, Render health checks, etc.)
+    if (!origin) return cb(null, true);
+    if (ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
+    return cb(new Error(`CORS_NOT_ALLOWED: ${origin}`));
+  },
+  methods: ["GET", "POST", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization"],
+};
+
+app.use(cors(corsOptions));
+app.options("*", cors(corsOptions)); // IMPORTANT: preflight must match
 
 app.use(express.json({ limit: "25mb" }));
 
@@ -127,11 +137,9 @@ async function putJson(key, obj) {
 }
 
 // ---------- magic link + email (Resend) ----------
-// Minimal in-memory store: projectId -> { tokenPlain, expiresAtIso, lastSentTo, lastSentAtIso }
 const MAGIC_LINKS = new Map();
 
 function genToken() {
-  // 32 bytes => 256-bit token
   return crypto.randomBytes(32).toString("base64url");
 }
 
@@ -185,9 +193,6 @@ app.get("/api/health", (_req, res) => {
 });
 
 // ---------- magic link: send ----------
-// FRONTEND EXPECTS: POST { to, projectId, token }
-// This endpoint mints (or reuses) token and emails the /producer minisite URL.
-// Also accepts legacy shape { email } for backward compatibility.
 app.post("/api/magic-link/send", async (req, res) => {
   try {
     const projectId = safe(req.body?.projectId);
@@ -199,12 +204,12 @@ app.post("/api/magic-link/send", async (req, res) => {
     const incomingToken = safe(req.body?.token);
 
     if (!projectId) return res.status(400).json({ ok: false, error: "MISSING_projectId" });
-    if (!emailRaw || !emailRaw.includes("@")) return res.status(400).json({ ok: false, error: "MISSING_email" });
+    if (!emailRaw || !emailRaw.includes("@"))
+      return res.status(400).json({ ok: false, error: "MISSING_email" });
 
     const now = new Date().toISOString();
     const base = getPublicBase();
 
-    // Reuse active token if not expired (resend = same active link)
     const existing = MAGIC_LINKS.get(projectId);
     let tokenPlain = "";
     let expiresAtIso = "";
@@ -215,7 +220,6 @@ app.post("/api/magic-link/send", async (req, res) => {
       new Date(existing.expiresAtIso) > new Date();
 
     if (incomingToken) {
-      // Frontend supplied token. Preserve existing expiry if still active; otherwise refresh expiry window.
       tokenPlain = incomingToken;
       expiresAtIso = existingActive ? existing.expiresAtIso : plusDaysIso(14);
 
@@ -240,7 +244,9 @@ app.post("/api/magic-link/send", async (req, res) => {
     }
 
     // IMPORTANT: producer minisite landing (not catalog)
-    const url = `${base}/minisite/${encodeURIComponent(projectId)}/producer?token=${encodeURIComponent(tokenPlain)}`;
+    const url = `${base}/minisite/${encodeURIComponent(projectId)}/producer?token=${encodeURIComponent(
+      tokenPlain
+    )}`;
 
     await sendMagicLinkEmail({
       to: emailRaw,
@@ -258,7 +264,6 @@ app.post("/api/magic-link/send", async (req, res) => {
       lastSentAtIso: now,
     });
 
-    // return url + token so UI can display/debug
     res.json({ ok: true, projectId, email: emailRaw, token: tokenPlain, url, expiresAt: expiresAtIso });
   } catch (e) {
     logErr(req, e);
@@ -356,7 +361,6 @@ app.post("/api/publish-minisite", async (req, res) => {
       return res.status(400).json({ ok: false, error: "MISSING_projectId_AND_snapshotKey" });
     }
 
-    // If snapshotKey not provided, resolve from latest.json
     if (!snapshotKey) {
       if (!projectId) return res.status(400).json({ ok: false, error: "MISSING_projectId" });
       const meta = await readJson(`storage/projects/${projectId}/producer_returns/latest.json`);
@@ -364,11 +368,9 @@ app.post("/api/publish-minisite", async (req, res) => {
       if (!snapshotKey) throw new Error("LATEST_snapshotKey_MISSING");
     }
 
-    // Read snapshot from S3
     const rawSnapshot = await readJson(snapshotKey);
     const cleanSnapshot = stripPlaybackUrls(rawSnapshot);
 
-    // Publish artifact
     const shareId = rand(12);
     const publicKey = `public/publish/${shareId}.json`;
 
@@ -399,7 +401,6 @@ app.get("/publish/:shareId.json", async (req, res) => {
     const json = await readJson(key);
     res.json(json);
   } catch (e) {
-    // Keep 404 for not-found, but log for debugging.
     logErr(req, e);
     res.status(404).json({ ok: false });
   }
