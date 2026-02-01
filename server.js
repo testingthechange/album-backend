@@ -185,13 +185,21 @@ app.get("/api/health", (_req, res) => {
 });
 
 // ---------- magic link: send ----------
+// FRONTEND EXPECTS: POST { to, projectId, token }
+// This endpoint mints (or reuses) token and emails the /producer minisite URL.
+// Also accepts legacy shape { email } for backward compatibility.
 app.post("/api/magic-link/send", async (req, res) => {
   try {
     const projectId = safe(req.body?.projectId);
-    const email = safe(req.body?.email).toLowerCase();
+
+    // accept either { to } or { email } (legacy)
+    const emailRaw = safe(req.body?.to || req.body?.email).toLowerCase();
+
+    // allow frontend to supply token (Project page mints it); otherwise we mint/reuse here
+    const incomingToken = safe(req.body?.token);
 
     if (!projectId) return res.status(400).json({ ok: false, error: "MISSING_projectId" });
-    if (!email || !email.includes("@")) return res.status(400).json({ ok: false, error: "MISSING_email" });
+    if (!emailRaw || !emailRaw.includes("@")) return res.status(400).json({ ok: false, error: "MISSING_email" });
 
     const now = new Date().toISOString();
     const base = getPublicBase();
@@ -201,7 +209,23 @@ app.post("/api/magic-link/send", async (req, res) => {
     let tokenPlain = "";
     let expiresAtIso = "";
 
-    if (existing?.tokenPlain && existing?.expiresAtIso && new Date(existing.expiresAtIso) > new Date()) {
+    const existingActive =
+      existing?.tokenPlain &&
+      existing?.expiresAtIso &&
+      new Date(existing.expiresAtIso) > new Date();
+
+    if (incomingToken) {
+      // Frontend supplied token. Preserve existing expiry if still active; otherwise refresh expiry window.
+      tokenPlain = incomingToken;
+      expiresAtIso = existingActive ? existing.expiresAtIso : plusDaysIso(14);
+
+      MAGIC_LINKS.set(projectId, {
+        tokenPlain,
+        expiresAtIso,
+        lastSentTo: "",
+        lastSentAtIso: "",
+      });
+    } else if (existingActive) {
       tokenPlain = existing.tokenPlain;
       expiresAtIso = existing.expiresAtIso;
     } else {
@@ -215,20 +239,27 @@ app.post("/api/magic-link/send", async (req, res) => {
       });
     }
 
-    const url = `${base}/minisite/${encodeURIComponent(projectId)}/catalog?token=${encodeURIComponent(tokenPlain)}`;
+    // IMPORTANT: producer minisite landing (not catalog)
+    const url = `${base}/minisite/${encodeURIComponent(projectId)}/producer?token=${encodeURIComponent(tokenPlain)}`;
 
-    await sendMagicLinkEmail({ to: email, projectId, url, expiresAt: expiresAtIso });
+    await sendMagicLinkEmail({
+      to: emailRaw,
+      projectId,
+      url,
+      expiresAt: expiresAtIso,
+    });
 
     const row = MAGIC_LINKS.get(projectId) || {};
     MAGIC_LINKS.set(projectId, {
       ...row,
       tokenPlain,
       expiresAtIso,
-      lastSentTo: email,
+      lastSentTo: emailRaw,
       lastSentAtIso: now,
     });
 
-    res.json({ ok: true, projectId, email, expiresAt: expiresAtIso });
+    // return url + token so UI can display/debug
+    res.json({ ok: true, projectId, email: emailRaw, token: tokenPlain, url, expiresAt: expiresAtIso });
   } catch (e) {
     logErr(req, e);
     res.status(500).json({ ok: false, error: errString(e) });
