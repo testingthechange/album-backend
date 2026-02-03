@@ -1,358 +1,119 @@
-// album-backend/server.js
-import express from "express";
-import cors from "cors";
-import multer from "multer";
-import crypto from "crypto";
-import { Resend } from "resend";
+// PATCH for album-backend/server.js
+// Adds:
+// 1) POST /api/publish        (alias to /api/publish-minisite so Export.jsx stops 404'ing)
+// 2) GET  /api/published/:id  (returns { ok:true, manifest } derived from published snapshot)
+// Optional: also writes manifest to S3 at public/manifests/{shareId}.json for caching
 
-import {
-  S3Client,
-  PutObjectCommand,
-  GetObjectCommand,
-  HeadObjectCommand,
-} from "@aws-sdk/client-s3";
-import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
+/* -------------------------------------------------------------------------- */
+/*  ADD THESE HELPERS somewhere near stripPlaybackUrls (before routes is fine) */
+/* -------------------------------------------------------------------------- */
 
-const app = express();
-app.set("trust proxy", 1);
+function parseDurationToSec(text) {
+  const s = String(text || "").trim();
+  const m = s.match(/^(\d+):([0-5]\d)$/);
+  if (!m) return 0;
+  return Number(m[1]) * 60 + Number(m[2]);
+}
 
-const upload = multer({ storage: multer.memoryStorage() });
-
-// ---------- env ----------
-const {
-  AWS_ACCESS_KEY_ID,
-  AWS_SECRET_ACCESS_KEY,
-  AWS_REGION,
-  S3_BUCKET,
-  PORT,
-
-  // magic link + email
-  PUBLIC_APP_BASE_URL,
-  RESEND_API_KEY,
-  FROM_EMAIL,
-} = process.env;
-
-if (!AWS_REGION) console.warn("WARN: AWS_REGION is not set");
-if (!S3_BUCKET) console.warn("WARN: S3_BUCKET is not set");
-
-// Resend client (no SMTP needed)
-const resend = RESEND_API_KEY ? new Resend(RESEND_API_KEY) : null;
-
-// If creds are not provided, the SDK will fall back to the environment / instance role.
-const s3 = new S3Client({
-  region: AWS_REGION || "us-east-1",
-  credentials:
-    AWS_ACCESS_KEY_ID && AWS_SECRET_ACCESS_KEY
-      ? { accessKeyId: AWS_ACCESS_KEY_ID, secretAccessKey: AWS_SECRET_ACCESS_KEY }
-      : undefined,
-});
-
-// ---------- cors (FIXED: add blockone + make OPTIONS use same config) ----------
-const ALLOWED_ORIGINS = [
-  // ✅ BlockOne (new)
-  "https://blockone.onrender.com",
-
-  // previous sites
-  "https://smartbridge2.onrender.com",
-  "https://betablocker.onrender.com",
-  "https://webshell-tm0u.onrender.com",
-
-  // local dev
-  "http://localhost:5173",
-  "http://localhost:4173",
-];
-
-const corsOptions = {
-  origin(origin, cb) {
-    // allow non-browser calls (curl, Render health checks, etc.)
-    if (!origin) return cb(null, true);
-    if (ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
-    return cb(new Error(`CORS_NOT_ALLOWED: ${origin}`));
-  },
-  methods: ["GET", "POST", "OPTIONS"],
-  allowedHeaders: ["Content-Type", "Authorization"],
-};
-
-app.use(cors(corsOptions));
-app.options("*", cors(corsOptions)); // IMPORTANT: preflight must match
-
-app.use(express.json({ limit: "25mb" }));
-
-// ---------- helpers ----------
-const iso = () => new Date().toISOString().replace(/[:.]/g, "-");
-const safe = (v) => String(v ?? "").trim();
-const rand = (n = 12) => crypto.randomBytes(n).toString("hex");
-
-/** Always produce a useful error string (AWS SDK errors are often objects). */
-function errString(e) {
-  if (!e) return "UNKNOWN_ERROR";
-  if (typeof e === "string") return e;
-  if (e instanceof Error) return `${e.name}: ${e.message}`;
-  try {
-    return JSON.stringify(e);
-  } catch {
-    return String(e);
+function firstS3Key(...candidates) {
+  for (const c of candidates) {
+    const k = String(c || "").trim();
+    if (k) return k;
   }
+  return "";
 }
 
-function logErr(req, e) {
-  const rid = req?.headers?.["x-request-id"] || req?.headers?.["x-render-request-id"] || "";
-  console.error(`ERROR ${req.method} ${req.originalUrl} requestID=${rid} ::`, e?.stack || e);
+function toArray(v) {
+  return Array.isArray(v) ? v : [];
 }
 
-async function signS3(key, expires = 1200) {
-  if (!S3_BUCKET) throw new Error("S3_BUCKET_NOT_SET");
-  const Key = safe(key);
-  if (!Key) throw new Error("S3_KEY_EMPTY");
-
-  // Head first to validate existence and produce a clearer error.
-  await s3.send(new HeadObjectCommand({ Bucket: S3_BUCKET, Key }));
-  return getSignedUrl(s3, new GetObjectCommand({ Bucket: S3_BUCKET, Key }), { expiresIn: expires });
+function ensureCredits(obj) {
+  const c = obj && typeof obj === "object" ? obj : {};
+  return {
+    songwriters: toArray(c.songwriters).map(String).filter(Boolean),
+    producers: toArray(c.producers).map(String).filter(Boolean),
+    engineers: toArray(c.engineers).map(String).filter(Boolean),
+    performers: toArray(c.performers).map(String).filter(Boolean),
+  };
 }
 
-async function readJson(key) {
-  const url = await signS3(key, 60);
-  const r = await fetch(url, { cache: "no-store" });
-  if (!r.ok) {
-    const text = await r.text().catch(() => "");
-    throw new Error(`READ_JSON_HTTP_${r.status}${text ? ` :: ${text.slice(0, 200)}` : ""}`);
-  }
-  return r.json();
-}
+function convertSnapshotToManifest({ shareId, projectId, snapshotKey, snapshot, publishedAt }) {
+  const snap = snapshot && typeof snapshot === "object" ? snapshot : {};
 
-async function putJson(key, obj) {
-  if (!S3_BUCKET) throw new Error("S3_BUCKET_NOT_SET");
-  const Key = safe(key);
-  if (!Key) throw new Error("S3_KEY_EMPTY");
+  const albumMeta = snap?.album?.meta || {};
+  const albumTitle = String(albumMeta.albumTitle || albumMeta.title || "");
+  const artistName = String(albumMeta.artistName || albumMeta.artist || "");
 
-  await s3.send(
-    new PutObjectCommand({
-      Bucket: S3_BUCKET,
-      Key,
-      Body: Buffer.from(JSON.stringify(obj)),
-      ContentType: "application/json",
-      CacheControl: "no-store",
-    })
-  );
-}
+  // cover: prefer album.cover.s3Key, else try album.coverKey, else empty
+  const coverS3Key = firstS3Key(snap?.album?.cover?.s3Key, snap?.album?.coverKey, snap?.album?.cover?.key);
 
-// ---------- magic link + email (Resend) ----------
-const MAGIC_LINKS = new Map();
+  const catalogSongs = toArray(snap?.catalog?.songs);
+  const metaSongs = toArray(snap?.meta?.songs);
 
-function genToken() {
-  return crypto.randomBytes(32).toString("base64url");
-}
+  const tracks = catalogSongs.map((row0, i) => {
+    const row = row0 && typeof row0 === "object" ? row0 : {};
+    const files = row?.files || {};
+    const slot = Number(row?.slot || i + 1);
 
-function plusDaysIso(days) {
-  const d = new Date();
-  d.setDate(d.getDate() + days);
-  return d.toISOString();
-}
+    const title =
+      String(row?.title || "").trim() ||
+      String(metaSongs?.[i]?.title || "").trim() ||
+      `Song ${i + 1}`;
 
-function getPublicBase() {
-  const base = safe(PUBLIC_APP_BASE_URL).replace(/\/+$/, "");
-  if (!base) throw new Error("PUBLIC_APP_BASE_URL_NOT_SET");
-  return base;
-}
+    const durationText = String(row?.duration || "").trim() || "0:00";
+    const durationSec = parseDurationToSec(durationText);
 
-async function sendMagicLinkEmail({ to, projectId, url, expiresAt }) {
-  if (!resend) throw new Error("RESEND_API_KEY_NOT_SET");
-  if (!safe(FROM_EMAIL)) throw new Error("FROM_EMAIL_NOT_SET");
+    // audio key: ALBUM first, then A, then B
+    const s3Key = firstS3Key(files?.album?.s3Key, files?.a?.s3Key, files?.b?.s3Key);
 
-  await resend.emails.send({
-    from: safe(FROM_EMAIL),
-    to,
-    subject: `Producer link — Project ${projectId}`,
-    text: `Open your project:
+    // meta credits/lyrics live in snap.meta.songs[i]
+    const metaRow = metaSongs?.[i] && typeof metaSongs[i] === "object" ? metaSongs[i] : {};
+    const credits = ensureCredits(metaRow?.credits);
+    const lyricsText = String(metaRow?.lyrics?.text || metaRow?.lyricsText || "").trim();
 
-${url}
-
-Expires: ${expiresAt}
-
-If you did not expect this email, ignore it.`,
+    return {
+      slot,
+      title,
+      durationText,
+      durationSec,
+      audio: { s3Key },
+      credits,
+      lyrics: { text: lyricsText, s3Key: "" },
+    };
   });
+
+  return {
+    ok: true,
+    shareId: String(shareId || "").trim(),
+    projectId: String(projectId || "").trim(),
+    lineage: {
+      snapshotKey: String(snapshotKey || "").trim(),
+      publishedAt: String(publishedAt || new Date().toISOString()),
+    },
+    album: {
+      meta: { albumTitle, artistName },
+      cover: { s3Key: coverS3Key },
+      trackDurations: tracks.map((t) => ({
+        slot: t.slot,
+        title: t.title,
+        s3Key: t.audio.s3Key,
+        durationSec: t.durationSec,
+        durationText: t.durationText,
+      })),
+      tracks, // keep full track objects too (credits + lyrics)
+    },
+    nftMix: snap?.nftMix || {},
+  };
 }
 
-// ---------- strip playbackUrl (CRITICAL FIX) ----------
-function stripPlaybackUrls(obj) {
-  if (Array.isArray(obj)) return obj.map(stripPlaybackUrls);
-  if (obj && typeof obj === "object") {
-    const out = {};
-    for (const [k, v] of Object.entries(obj)) {
-      if (k === "playbackUrl" || k === "url") continue;
-      out[k] = stripPlaybackUrls(v);
-    }
-    return out;
-  }
-  return obj;
-}
+/* -------------------------------------------------------------------------- */
+/*  ADD THESE ROUTES near your publish routes                                 */
+/* -------------------------------------------------------------------------- */
 
-// ---------- health ----------
-app.get("/api/health", (_req, res) => {
-  res.json({ ok: true, service: "album-backend" });
-});
-
-// ---------- magic link: send ----------
-app.post("/api/magic-link/send", async (req, res) => {
-  try {
-    const projectId = safe(req.body?.projectId);
-
-    // accept either { to } or { email } (legacy)
-    const emailRaw = safe(req.body?.to || req.body?.email).toLowerCase();
-
-    // allow frontend to supply token (Project page mints it); otherwise we mint/reuse here
-    const incomingToken = safe(req.body?.token);
-
-    if (!projectId) return res.status(400).json({ ok: false, error: "MISSING_projectId" });
-    if (!emailRaw || !emailRaw.includes("@"))
-      return res.status(400).json({ ok: false, error: "MISSING_email" });
-
-    const now = new Date().toISOString();
-    const base = getPublicBase();
-
-    const existing = MAGIC_LINKS.get(projectId);
-    let tokenPlain = "";
-    let expiresAtIso = "";
-
-    const existingActive =
-      existing?.tokenPlain &&
-      existing?.expiresAtIso &&
-      new Date(existing.expiresAtIso) > new Date();
-
-    if (incomingToken) {
-      tokenPlain = incomingToken;
-      expiresAtIso = existingActive ? existing.expiresAtIso : plusDaysIso(14);
-
-      MAGIC_LINKS.set(projectId, {
-        tokenPlain,
-        expiresAtIso,
-        lastSentTo: "",
-        lastSentAtIso: "",
-      });
-    } else if (existingActive) {
-      tokenPlain = existing.tokenPlain;
-      expiresAtIso = existing.expiresAtIso;
-    } else {
-      tokenPlain = genToken();
-      expiresAtIso = plusDaysIso(14);
-      MAGIC_LINKS.set(projectId, {
-        tokenPlain,
-        expiresAtIso,
-        lastSentTo: "",
-        lastSentAtIso: "",
-      });
-    }
-
-    // IMPORTANT: producer minisite landing (not catalog)
-    const url = `${base}/minisite/${encodeURIComponent(projectId)}/producer?token=${encodeURIComponent(
-      tokenPlain
-    )}`;
-
-    await sendMagicLinkEmail({
-      to: emailRaw,
-      projectId,
-      url,
-      expiresAt: expiresAtIso,
-    });
-
-    const row = MAGIC_LINKS.get(projectId) || {};
-    MAGIC_LINKS.set(projectId, {
-      ...row,
-      tokenPlain,
-      expiresAtIso,
-      lastSentTo: emailRaw,
-      lastSentAtIso: now,
-    });
-
-    res.json({ ok: true, projectId, email: emailRaw, token: tokenPlain, url, expiresAt: expiresAtIso });
-  } catch (e) {
-    logErr(req, e);
-    res.status(500).json({ ok: false, error: errString(e) });
-  }
-});
-
-// ---------- upload (editor only) ----------
-app.post("/api/upload-to-s3", upload.single("file"), async (req, res) => {
-  try {
-    const projectId = safe(req.query.projectId || req.body?.projectId);
-    if (!projectId || !req.file) {
-      return res.status(400).json({ ok: false, error: "MISSING_projectId_OR_file" });
-    }
-    if (!S3_BUCKET) return res.status(500).json({ ok: false, error: "S3_BUCKET_NOT_SET" });
-
-    const key = `storage/projects/${projectId}/uploads/${iso()}__${req.file.originalname}`;
-    await s3.send(
-      new PutObjectCommand({
-        Bucket: S3_BUCKET,
-        Key: key,
-        Body: req.file.buffer,
-        ContentType: req.file.mimetype,
-      })
-    );
-
-    const playbackUrl = await signS3(key);
-    res.json({ ok: true, s3Key: key, playbackUrl });
-  } catch (e) {
-    logErr(req, e);
-    res.status(500).json({ ok: false, error: errString(e) });
-  }
-});
-
-// ---------- playback (runtime) ----------
-app.get("/api/playback-url", async (req, res) => {
-  try {
-    const key = decodeURIComponent(safe(req.query.s3Key));
-    if (!key) return res.status(400).json({ ok: false, error: "MISSING_s3Key" });
-    const url = await signS3(key);
-    res.json({ ok: true, url, playbackUrl: url });
-  } catch (e) {
-    logErr(req, e);
-    res.status(500).json({ ok: false, error: errString(e) });
-  }
-});
-
-// ---------- master save ----------
-app.post("/api/master-save", async (req, res) => {
-  try {
-    const pid = safe(req.body?.projectId);
-    const project = req.body?.project;
-    if (!pid || !project) {
-      return res.status(400).json({ ok: false, error: "MISSING_projectId_OR_project" });
-    }
-
-    const snapKey = `storage/projects/${pid}/producer_returns/snapshots/${iso()}.json`;
-    const latestKey = `storage/projects/${pid}/producer_returns/latest.json`;
-
-    await putJson(snapKey, project);
-    await putJson(latestKey, {
-      projectId: pid,
-      latestSnapshotKey: snapKey,
-      lastMasterSaveAt: new Date().toISOString(),
-    });
-
-    res.json({ ok: true, snapshotKey: snapKey });
-  } catch (e) {
-    logErr(req, e);
-    res.status(500).json({ ok: false, error: errString(e) });
-  }
-});
-
-// ---------- master save latest ----------
-app.get("/api/master-save/latest/:projectId", async (req, res) => {
-  try {
-    const projectId = safe(req.params.projectId);
-    if (!projectId) return res.status(400).json({ ok: false, error: "MISSING_projectId" });
-
-    const meta = await readJson(`storage/projects/${projectId}/producer_returns/latest.json`);
-    res.json({ ok: true, ...meta });
-  } catch (e) {
-    logErr(req, e);
-    res.status(500).json({ ok: false, error: errString(e) });
-  }
-});
-
-// ---------- publish ----------
-app.post("/api/publish-minisite", async (req, res) => {
+// 1) ALIAS: Export.jsx calls /api/publish, but backend currently has /api/publish-minisite
+app.post("/api/publish", async (req, res) => {
+  // exact same behavior as /api/publish-minisite
+  // (copy-paste the handler body so we don't rely on express internal routing)
   try {
     const projectId = safe(req.body?.projectId);
     let snapshotKey = safe(req.body?.snapshotKey);
@@ -394,25 +155,54 @@ app.post("/api/publish-minisite", async (req, res) => {
   }
 });
 
-// ---------- publish GET ----------
-app.get("/publish/:shareId.json", async (req, res) => {
+// 2) PUBLISHED MANIFEST: Player.jsx expects GET /api/published/:shareId
+app.get("/api/published/:shareId", async (req, res) => {
   try {
-    const key = `public/publish/${safe(req.params.shareId)}.json`;
+    const shareId = safe(req.params.shareId);
+    if (!shareId) return res.status(400).json({ ok: false, error: "MISSING_shareId" });
+
+    // read the published artifact
+    const pubKey = `public/publish/${shareId}.json`;
+    const pub = await readJson(pubKey);
+
+    const snapshot = pub?.snapshot;
+    const snapshotKey = safe(pub?.snapshotKey);
+    const projectId = safe(pub?.projectId || snapshot?.projectId);
+
+    const manifest = convertSnapshotToManifest({
+      shareId,
+      projectId,
+      snapshotKey,
+      snapshot,
+      publishedAt: pub?.createdAt || new Date().toISOString(),
+    });
+
+    // OPTIONAL CACHE (recommended): write manifest so future loads are fast + stable
+    // (safe even if you keep it; it contains only s3Key, no playbackUrl)
+    const manifestKey = `public/manifests/${shareId}.json`;
+    try {
+      await putJson(manifestKey, manifest);
+    } catch (e) {
+      // non-fatal; still return manifest
+      console.warn("WARN: manifest cache write failed:", errString(e));
+    }
+
+    res.json({ ok: true, shareId, manifest, manifestKey, manifestUrl: `/manifests/${shareId}.json` });
+  } catch (e) {
+    logErr(req, e);
+    res.status(404).json({ ok: false, error: errString(e) });
+  }
+});
+
+// OPTIONAL: serve manifest cache directly (handy for debugging)
+// NOTE: this reads from S3 via readJson, not from local filesystem.
+app.get("/manifests/:shareId.json", async (req, res) => {
+  try {
+    const key = `public/manifests/${safe(req.params.shareId)}.json`;
     const json = await readJson(key);
     res.json(json);
   } catch (e) {
     logErr(req, e);
     res.status(404).json({ ok: false });
   }
-});
-
-// ---------- root ----------
-app.get("/", (_req, res) => {
-  res.send("album-backend OK");
-});
-
-// ---------- start ----------
-const port = Number(PORT || 10000);
-app.listen(port, () => {
-  console.log(`album-backend listening on ${port}`);
 });
