@@ -1,30 +1,28 @@
 // FILE: server.js
-// Goal: make /publish/:shareId.json fetchable from https://thirdparty-tz9x.onrender.com.
-// This version DOES NOT rely on the cors package for the critical header.
-// It FORCE-SETS CORS headers for allowed origins (and handles OPTIONS) before any routes.
+// Drop-in server.js that boots without ./lib/storage.js or ./lib/stripPlaybackUrls.js
+// Provides:
+// - Forced CORS for https://thirdparty-tz9x.onrender.com (+ localhost)
+// - GET  /publish/:shareId.json          reads S3 key public/publish/{shareId}.json
+// - POST /api/publish-minisite           writes S3 publish wrapper
+// - POST /api/publish                   alias
+//
+// Requires AWS env vars (likely already set in Render):
+// - AWS_REGION (or AWS_DEFAULT_REGION)
+// - AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY (or IAM role)
+// - S3_BUCKET (or BUCKET / AWS_S3_BUCKET / S3_BUCKET_NAME)
 
 import express from "express";
-// cors import can stay, but we are not relying on it for the critical header
-import cors from "cors";
-
-// ---- KEEP/ADJUST these two imports to match your repo (they must exist)
-import { readJson, putJson } from "./lib/storage.js";
-import { stripPlaybackUrls } from "./lib/stripPlaybackUrls.js";
+import { S3Client, GetObjectCommand, PutObjectCommand } from "@aws-sdk/client-s3";
 
 const app = express();
-
-// Fingerprint (confirm Render is running THIS file)
-console.log("BOOT: album-backend server.js vCORS-FORCED-2026-02-10-1758");
+console.log("BOOT: album-backend server.js vINLINE-S3-CORS-2026-02-10-1805");
 
 app.use(express.json({ limit: "20mb" }));
 
 /* -------------------------------------------------------------------------- */
-/*  FORCED CORS (MUST be before routes)                                       */
+/*  FORCED CORS (must be before routes)                                       */
 /* -------------------------------------------------------------------------- */
-/**
- * Your curl test proved ACAO is missing when Origin is present.
- * This middleware hard-sets the headers for known origins so browser fetch works.
- */
+
 const ALLOWED_ORIGINS = new Set([
   "https://thirdparty-tz9x.onrender.com",
   "http://localhost:5173",
@@ -39,37 +37,77 @@ app.use((req, res, next) => {
     res.setHeader("Vary", "Origin");
   }
 
-  // Always set these (safe)
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
 
-  // Preflight
   if (req.method === "OPTIONS") return res.sendStatus(204);
-
   next();
 });
 
-/**
- * Keep cors() as a non-critical helper (optional).
- * If it ever behaves oddly, the forced headers above still make the browser work.
- */
-app.use(
-  cors({
-    origin: (origin, cb) => cb(null, !origin || ALLOWED_ORIGINS.has(origin)),
-    methods: ["GET", "POST", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Authorization"],
-  })
-);
+/* -------------------------------------------------------------------------- */
+/*  AWS / S3 helpers                                                          */
+/* -------------------------------------------------------------------------- */
+
+function envFirst(...keys) {
+  for (const k of keys) {
+    const v = String(process.env[k] || "").trim();
+    if (v) return v;
+  }
+  return "";
+}
+
+const AWS_REGION =
+  envFirst("AWS_REGION", "AWS_DEFAULT_REGION") || "us-west-1"; // fallback only
+const S3_BUCKET = envFirst("S3_BUCKET", "AWS_S3_BUCKET", "S3_BUCKET_NAME", "BUCKET");
+
+if (!S3_BUCKET) {
+  console.warn("WARN: Missing S3 bucket env var. Set S3_BUCKET (or BUCKET/AWS_S3_BUCKET).");
+}
+
+const s3 = new S3Client({ region: AWS_REGION });
+
+async function streamToString(body) {
+  // AWS SDK v3 returns ReadableStream/Readable in Node
+  if (!body) return "";
+  if (typeof body.transformToString === "function") return await body.transformToString();
+  return await new Promise((resolve, reject) => {
+    const chunks = [];
+    body.on("data", (c) => chunks.push(Buffer.from(c)));
+    body.on("error", reject);
+    body.on("end", () => resolve(Buffer.concat(chunks).toString("utf-8")));
+  });
+}
+
+async function readJson(key) {
+  if (!S3_BUCKET) throw new Error("MISSING_S3_BUCKET");
+  const out = await s3.send(new GetObjectCommand({ Bucket: S3_BUCKET, Key: key }));
+  const text = await streamToString(out.Body);
+  return JSON.parse(text);
+}
+
+async function putJson(key, obj) {
+  if (!S3_BUCKET) throw new Error("MISSING_S3_BUCKET");
+  const body = JSON.stringify(obj);
+  await s3.send(
+    new PutObjectCommand({
+      Bucket: S3_BUCKET,
+      Key: key,
+      Body: body,
+      ContentType: "application/json; charset=utf-8",
+      CacheControl: "no-store",
+    })
+  );
+}
 
 /* -------------------------------------------------------------------------- */
-/*  Small utils (inline so we can't crash on missing util imports)            */
+/*  Minimal utils                                                             */
 /* -------------------------------------------------------------------------- */
 
 function safe(v) {
   return String(v ?? "").trim();
 }
 
-function rand(n = 24) {
+function randHex(n = 24) {
   const chars = "abcdef0123456789";
   let out = "";
   for (let i = 0; i < n; i++) out += chars[Math.floor(Math.random() * chars.length)];
@@ -83,16 +121,45 @@ function errString(e) {
 }
 
 function logErr(req, e) {
-  try {
-    console.error("ERR", {
-      path: req?.path,
-      method: req?.method,
-      msg: errString(e),
-      stack: e?.stack,
-    });
-  } catch {
-    console.error("ERR", errString(e));
+  console.error("ERR", {
+    path: req?.path,
+    method: req?.method,
+    msg: errString(e),
+    stack: e?.stack,
+  });
+}
+
+/**
+ * Minimal strip: remove fields commonly used to leak signed URLs
+ * (keeps s3Key, removes playbackUrl/url fields if present)
+ */
+function stripPlaybackUrls(obj) {
+  const seen = new WeakSet();
+
+  function walk(x) {
+    if (!x || typeof x !== "object") return x;
+    if (seen.has(x)) return x;
+    seen.add(x);
+
+    if (Array.isArray(x)) {
+      for (const v of x) walk(v);
+      return x;
+    }
+
+    for (const k of Object.keys(x)) {
+      if (k === "playbackUrl" || k === "playbackURL" || k === "url" || k === "urls") {
+        // only delete obvious signed-url style fields; keep other structures intact
+        delete x[k];
+        continue;
+      }
+      walk(x[k]);
+    }
+    return x;
   }
+
+  // deep clone to avoid mutating stored snapshots
+  const clone = JSON.parse(JSON.stringify(obj || {}));
+  return walk(clone);
 }
 
 /* -------------------------------------------------------------------------- */
@@ -100,9 +167,8 @@ function logErr(req, e) {
 /* -------------------------------------------------------------------------- */
 
 app.get("/", (req, res) => res.send("album-backend OK"));
-app.get("/health", (req, res) => res.json({ ok: true }));
+app.get("/health", (req, res) => res.json({ ok: true, region: AWS_REGION, bucket: !!S3_BUCKET }));
 
-// Read published wrapper from S3 at public/publish/{shareId}.json
 app.get("/publish/:shareId.json", async (req, res) => {
   try {
     const shareId = safe(req.params.shareId);
@@ -110,15 +176,18 @@ app.get("/publish/:shareId.json", async (req, res) => {
 
     const key = `public/publish/${shareId}.json`;
     const json = await readJson(key);
-
     return res.json(json);
   } catch (e) {
     logErr(req, e);
-    return res.status(404).json({ ok: false, error: "NOT_FOUND" });
+    // 404 for missing keys, 500 for real failures
+    const msg = errString(e);
+    if (msg.includes("NoSuchKey") || msg.includes("NOT_FOUND")) {
+      return res.status(404).json({ ok: false, error: "NOT_FOUND" });
+    }
+    return res.status(500).json({ ok: false, error: msg });
   }
 });
 
-// Core publisher (matches your prod reality: POST /api/publish-minisite)
 app.post("/api/publish-minisite", async (req, res) => {
   try {
     const projectId = safe(req.body?.projectId);
@@ -129,8 +198,8 @@ app.post("/api/publish-minisite", async (req, res) => {
     }
 
     if (!snapshotKey) {
-      if (!projectId) return res.status(400).json({ ok: false, error: "MISSING_projectId" });
-      const meta = await readJson(`storage/projects/${projectId}/producer_returns/latest.json`);
+      const metaKey = `storage/projects/${projectId}/producer_returns/latest.json`;
+      const meta = await readJson(metaKey);
       snapshotKey = safe(meta?.latestSnapshotKey);
       if (!snapshotKey) throw new Error("LATEST_snapshotKey_MISSING");
     }
@@ -138,7 +207,7 @@ app.post("/api/publish-minisite", async (req, res) => {
     const rawSnapshot = await readJson(snapshotKey);
     const cleanSnapshot = stripPlaybackUrls(rawSnapshot);
 
-    const shareId = rand(24);
+    const shareId = randHex(24);
     const publicKey = `public/publish/${shareId}.json`;
 
     await putJson(publicKey, {
@@ -161,8 +230,8 @@ app.post("/api/publish-minisite", async (req, res) => {
   }
 });
 
-// Alias (so callers using /api/publish keep working)
 app.post("/api/publish", async (req, res) => {
+  // alias to publish-minisite (duplicate body to keep it simple/robust)
   try {
     const projectId = safe(req.body?.projectId);
     let snapshotKey = safe(req.body?.snapshotKey);
@@ -172,8 +241,8 @@ app.post("/api/publish", async (req, res) => {
     }
 
     if (!snapshotKey) {
-      if (!projectId) return res.status(400).json({ ok: false, error: "MISSING_projectId" });
-      const meta = await readJson(`storage/projects/${projectId}/producer_returns/latest.json`);
+      const metaKey = `storage/projects/${projectId}/producer_returns/latest.json`;
+      const meta = await readJson(metaKey);
       snapshotKey = safe(meta?.latestSnapshotKey);
       if (!snapshotKey) throw new Error("LATEST_snapshotKey_MISSING");
     }
@@ -181,7 +250,7 @@ app.post("/api/publish", async (req, res) => {
     const rawSnapshot = await readJson(snapshotKey);
     const cleanSnapshot = stripPlaybackUrls(rawSnapshot);
 
-    const shareId = rand(24);
+    const shareId = randHex(24);
     const publicKey = `public/publish/${shareId}.json`;
 
     await putJson(publicKey, {
@@ -213,10 +282,6 @@ app.use((err, req, res, next) => {
   if (res.headersSent) return next(err);
   return res.status(500).json({ ok: false, error: errString(err) });
 });
-
-/* -------------------------------------------------------------------------- */
-/*  START                                                                     */
-/* -------------------------------------------------------------------------- */
 
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
