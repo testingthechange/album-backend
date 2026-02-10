@@ -1,12 +1,15 @@
 // FILE: server.js
-// Updated drop-in server.js (robust) with two key fixes:
+// Updated drop-in server.js (robust) with your base + ONE missing piece that blocks playback:
 //
-// 1) CORS headers are set for *every* response (including errors), and OPTIONS always returns 204.
-// 2) All async routes are wrapped so thrown errors go through our JSON error handler
-//    (prevents Express default HTML 500 pages).
+// ✅ Adds GET /api/playback-url?s3Key=...  -> returns { ok:true, url, playbackUrl }
+//    so webshell222 can sign audio + cover URLs and actually play.
 //
-// This version does NOT import ./lib/storage.js or ./lib/stripPlaybackUrls.js.
-// It reads/writes JSON directly to S3 using @aws-sdk/client-s3.
+// Keeps:
+// - Forced CORS for every response (incl errors) + OPTIONS=204
+// - Async route wrapper + JSON error handler (no HTML 500 pages)
+// - Inline S3 read/write (no ./lib deps)
+// - /publish/:shareId.json
+// - /api/publish-minisite and /api/publish alias
 //
 // Required env (match whatever you already use in Render):
 // - S3_BUCKET  (preferred) OR BUCKET OR AWS_S3_BUCKET OR S3_BUCKET_NAME
@@ -14,9 +17,10 @@
 
 import express from "express";
 import { S3Client, GetObjectCommand, PutObjectCommand } from "@aws-sdk/client-s3";
+import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 
 const app = express();
-console.log("BOOT: album-backend server.js vINLINE-S3-CORS-ERRWRAP-2026-02-10-1820");
+console.log("BOOT: album-backend server.js vINLINE-S3-CORS-ERRWRAP-SIGN-2026-02-10-1845");
 
 app.use(express.json({ limit: "20mb" }));
 
@@ -38,7 +42,6 @@ function applyCors(req, res) {
     res.setHeader("Vary", "Origin");
   }
 
-  // Always set preflight-related headers (safe even when Origin is missing)
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
 }
@@ -83,7 +86,6 @@ function logErr(req, e) {
   }
 }
 
-// Wrap async handlers so errors go to our JSON error middleware (no HTML 500)
 const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
 
 /* -------------------------------------------------------------------------- */
@@ -186,8 +188,33 @@ app.get("/", (req, res) => res.send("album-backend OK"));
 app.get(
   "/health",
   wrap(async (req, res) => {
-    // No S3 calls here. This must always be 200 if the process is alive.
     res.json({ ok: true, region: AWS_REGION, bucketConfigured: !!S3_BUCKET });
+  })
+);
+
+/**
+ * ✅ SIGNED PLAYBACK URL
+ * webshell222 calls:
+ *   GET /api/playback-url?s3Key=...
+ * and expects:
+ *   { ok:true, url, playbackUrl }
+ */
+app.get(
+  "/api/playback-url",
+  wrap(async (req, res) => {
+    const s3Key = safe(req.query?.s3Key);
+    if (!s3Key) return res.status(400).json({ ok: false, error: "MISSING_s3Key" });
+    if (!S3_BUCKET) return res.status(500).json({ ok: false, error: "MISSING_S3_BUCKET" });
+
+    const expiresIn = 60 * 20; // 20 minutes
+
+    const url = await getSignedUrl(
+      s3,
+      new GetObjectCommand({ Bucket: S3_BUCKET, Key: s3Key }),
+      { expiresIn }
+    );
+
+    return res.json({ ok: true, s3Key, url, playbackUrl: url, expiresIn });
   })
 );
 
@@ -291,7 +318,6 @@ app.post(
 app.use((err, req, res, next) => {
   logErr(req, err);
 
-  // ensure CORS headers even on errors
   try {
     applyCors(req, res);
   } catch {}
@@ -300,7 +326,6 @@ app.use((err, req, res, next) => {
 
   const msg = errString(err);
 
-  // best-effort 404 mapping for missing keys
   if (
     msg.includes("NoSuchKey") ||
     msg.includes("NotFound") ||
