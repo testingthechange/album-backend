@@ -1,11 +1,41 @@
-// PATCH for album-backend/server.js
-// Adds:
-// 1) POST /api/publish        (alias to /api/publish-minisite so Export.jsx stops 404'ing)
-// 2) GET  /api/published/:id  (returns { ok:true, manifest } derived from published snapshot)
-// Optional: also writes manifest to S3 at public/manifests/{shareId}.json for caching
+// server.js (full updated template)
+// Replace your existing server.js with this ONLY if your current file is close to this structure.
+// If your repo has additional routes/middleware, merge them in carefully.
+
+import express from "express";
+import cors from "cors";
+
+// ---- these must already exist in your codebase (keep your existing imports if names differ)
+import { readJson, putJson } from "./lib/storage.js"; // adjust path
+import { stripPlaybackUrls } from "./lib/stripPlaybackUrls.js"; // adjust path
+import { safe, rand, errString, logErr } from "./lib/util.js"; // adjust path
+
+const app = express();
+
+// Body parsing
+app.use(express.json({ limit: "20mb" }));
 
 /* -------------------------------------------------------------------------- */
-/*  ADD THESE HELPERS somewhere near stripPlaybackUrls (before routes is fine) */
+/*  CORS (MUST be before routes so even 500/404 include ACAO header)           */
+/* -------------------------------------------------------------------------- */
+
+const ALLOWED = new Set([
+  "https://thirdparty-tz9x.onrender.com",
+  "http://localhost:5173",
+  "http://localhost:3000",
+]);
+
+app.use(
+  cors({
+    origin: (origin, cb) => cb(null, !origin || ALLOWED.has(origin)),
+    methods: ["GET", "POST", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization"],
+  })
+);
+app.options("*", cors());
+
+/* -------------------------------------------------------------------------- */
+/*  HELPERS (from your patch)                                                 */
 /* -------------------------------------------------------------------------- */
 
 function parseDurationToSec(text) {
@@ -44,7 +74,6 @@ function convertSnapshotToManifest({ shareId, projectId, snapshotKey, snapshot, 
   const albumTitle = String(albumMeta.albumTitle || albumMeta.title || "");
   const artistName = String(albumMeta.artistName || albumMeta.artist || "");
 
-  // cover: prefer album.cover.s3Key, else try album.coverKey, else empty
   const coverS3Key = firstS3Key(snap?.album?.cover?.s3Key, snap?.album?.coverKey, snap?.album?.cover?.key);
 
   const catalogSongs = toArray(snap?.catalog?.songs);
@@ -63,10 +92,8 @@ function convertSnapshotToManifest({ shareId, projectId, snapshotKey, snapshot, 
     const durationText = String(row?.duration || "").trim() || "0:00";
     const durationSec = parseDurationToSec(durationText);
 
-    // audio key: ALBUM first, then A, then B
     const s3Key = firstS3Key(files?.album?.s3Key, files?.a?.s3Key, files?.b?.s3Key);
 
-    // meta credits/lyrics live in snap.meta.songs[i]
     const metaRow = metaSongs?.[i] && typeof metaSongs[i] === "object" ? metaSongs[i] : {};
     const credits = ensureCredits(metaRow?.credits);
     const lyricsText = String(metaRow?.lyrics?.text || metaRow?.lyricsText || "").trim();
@@ -100,20 +127,40 @@ function convertSnapshotToManifest({ shareId, projectId, snapshotKey, snapshot, 
         durationSec: t.durationSec,
         durationText: t.durationText,
       })),
-      tracks, // keep full track objects too (credits + lyrics)
+      tracks,
     },
     nftMix: snap?.nftMix || {},
   };
 }
 
 /* -------------------------------------------------------------------------- */
-/*  ADD THESE ROUTES near your publish routes                                 */
+/*  ROUTES                                                                     */
 /* -------------------------------------------------------------------------- */
 
-// 1) ALIAS: Export.jsx calls /api/publish, but backend currently has /api/publish-minisite
+// Health
+app.get("/health", (req, res) => res.json({ ok: true }));
+
+// IMPORTANT: this route is what your frontend error was calling.
+// If your backend already has /publish/:id.json, keep only ONE version.
+app.get("/publish/:shareId.json", async (req, res) => {
+  try {
+    const shareId = safe(req.params.shareId);
+    if (!shareId) return res.status(400).json({ ok: false, error: "MISSING_shareId" });
+
+    const key = `public/publish/${shareId}.json`;
+    const json = await readJson(key);
+
+    // Return the published snapshot artifact
+    return res.json(json);
+  } catch (e) {
+    logErr(req, e);
+    // If missing, this should be 404 (not 500)
+    return res.status(404).json({ ok: false, error: "NOT_FOUND" });
+  }
+});
+
+// 1) ALIAS: Export.jsx calls /api/publish, backend previously had /api/publish-minisite
 app.post("/api/publish", async (req, res) => {
-  // exact same behavior as /api/publish-minisite
-  // (copy-paste the handler body so we don't rely on express internal routing)
   try {
     const projectId = safe(req.body?.projectId);
     let snapshotKey = safe(req.body?.snapshotKey);
@@ -143,7 +190,7 @@ app.post("/api/publish", async (req, res) => {
       createdAt: new Date().toISOString(),
     });
 
-    res.json({
+    return res.json({
       ok: true,
       shareId,
       snapshotKey,
@@ -151,7 +198,7 @@ app.post("/api/publish", async (req, res) => {
     });
   } catch (e) {
     logErr(req, e);
-    res.status(500).json({ ok: false, error: errString(e) });
+    return res.status(500).json({ ok: false, error: errString(e) });
   }
 });
 
@@ -161,7 +208,6 @@ app.get("/api/published/:shareId", async (req, res) => {
     const shareId = safe(req.params.shareId);
     if (!shareId) return res.status(400).json({ ok: false, error: "MISSING_shareId" });
 
-    // read the published artifact
     const pubKey = `public/publish/${shareId}.json`;
     const pub = await readJson(pubKey);
 
@@ -177,32 +223,39 @@ app.get("/api/published/:shareId", async (req, res) => {
       publishedAt: pub?.createdAt || new Date().toISOString(),
     });
 
-    // OPTIONAL CACHE (recommended): write manifest so future loads are fast + stable
-    // (safe even if you keep it; it contains only s3Key, no playbackUrl)
+    // Optional cache write
     const manifestKey = `public/manifests/${shareId}.json`;
     try {
       await putJson(manifestKey, manifest);
     } catch (e) {
-      // non-fatal; still return manifest
       console.warn("WARN: manifest cache write failed:", errString(e));
     }
 
-    res.json({ ok: true, shareId, manifest, manifestKey, manifestUrl: `/manifests/${shareId}.json` });
+    return res.json({ ok: true, shareId, manifest, manifestKey, manifestUrl: `/manifests/${shareId}.json` });
   } catch (e) {
     logErr(req, e);
-    res.status(404).json({ ok: false, error: errString(e) });
+    return res.status(404).json({ ok: false, error: errString(e) });
   }
 });
 
-// OPTIONAL: serve manifest cache directly (handy for debugging)
-// NOTE: this reads from S3 via readJson, not from local filesystem.
+// Optional: serve manifest cache
 app.get("/manifests/:shareId.json", async (req, res) => {
   try {
-    const key = `public/manifests/${safe(req.params.shareId)}.json`;
+    const shareId = safe(req.params.shareId);
+    const key = `public/manifests/${shareId}.json`;
     const json = await readJson(key);
-    res.json(json);
+    return res.json(json);
   } catch (e) {
     logErr(req, e);
-    res.status(404).json({ ok: false });
+    return res.status(404).json({ ok: false });
   }
+});
+
+/* -------------------------------------------------------------------------- */
+/*  START                                                                      */
+/* -------------------------------------------------------------------------- */
+
+const PORT = process.env.PORT || 3001;
+app.listen(PORT, () => {
+  console.log(`album-backend listening on ${PORT}`);
 });
