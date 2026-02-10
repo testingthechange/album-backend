@@ -1,22 +1,30 @@
-// server.js (full updated template)
-// Replace your existing server.js with this ONLY if your current file is close to this structure.
-// If your repo has additional routes/middleware, merge them in carefully.
+// FILE: server.js
+// Full updated server with:
+// - CORS that works for browser fetch from https://thirdparty-tz9x.onrender.com
+// - GET  /publish/:shareId.json          (reads S3 key public/publish/{shareId}.json)
+// - POST /api/publish-minisite           (THIS matches what is live in your prod backend)
+// - POST /api/publish                   (alias; same behavior)
+// - GET  /api/published/:shareId         (optional manifest wrapper)
+// - GET  /manifests/:shareId.json        (optional cached manifest)
+//
+// IMPORTANT:
+// 1) Adjust the 3 import lines below to match your repo paths/names if needed.
+// 2) Do NOT change your storage key prefixes unless you know your bucket layout.
+// 3) Deploy this to album-backend and retest webshell222 fetch.
 
 import express from "express";
 import cors from "cors";
 
-// ---- these must already exist in your codebase (keep your existing imports if names differ)
-import { readJson, putJson } from "./lib/storage.js"; // adjust path
-import { stripPlaybackUrls } from "./lib/stripPlaybackUrls.js"; // adjust path
-import { safe, rand, errString, logErr } from "./lib/util.js"; // adjust path
+// ---- Adjust these to your repo (keep your existing ones if they differ)
+import { readJson, putJson } from "./lib/storage.js";
+import { stripPlaybackUrls } from "./lib/stripPlaybackUrls.js";
+import { safe, rand, errString, logErr } from "./lib/util.js";
 
 const app = express();
-
-// Body parsing
 app.use(express.json({ limit: "20mb" }));
 
 /* -------------------------------------------------------------------------- */
-/*  CORS (MUST be before routes so even 500/404 include ACAO header)           */
+/*  CORS (MUST be before routes)                                              */
 /* -------------------------------------------------------------------------- */
 
 const ALLOWED = new Set([
@@ -32,10 +40,12 @@ app.use(
     allowedHeaders: ["Content-Type", "Authorization"],
   })
 );
+
+// Ensure preflight always succeeds
 app.options("*", cors());
 
 /* -------------------------------------------------------------------------- */
-/*  HELPERS (from your patch)                                                 */
+/*  HELPERS (manifest conversion; optional)                                   */
 /* -------------------------------------------------------------------------- */
 
 function parseDurationToSec(text) {
@@ -76,6 +86,7 @@ function convertSnapshotToManifest({ shareId, projectId, snapshotKey, snapshot, 
 
   const coverS3Key = firstS3Key(snap?.album?.cover?.s3Key, snap?.album?.coverKey, snap?.album?.cover?.key);
 
+  // Your published wrapper currently has snapshot.catalog.songs
   const catalogSongs = toArray(snap?.catalog?.songs);
   const metaSongs = toArray(snap?.meta?.songs);
 
@@ -92,6 +103,7 @@ function convertSnapshotToManifest({ shareId, projectId, snapshotKey, snapshot, 
     const durationText = String(row?.duration || "").trim() || "0:00";
     const durationSec = parseDurationToSec(durationText);
 
+    // Prefer album, then a, then b
     const s3Key = firstS3Key(files?.album?.s3Key, files?.a?.s3Key, files?.b?.s3Key);
 
     const metaRow = metaSongs?.[i] && typeof metaSongs[i] === "object" ? metaSongs[i] : {};
@@ -134,14 +146,16 @@ function convertSnapshotToManifest({ shareId, projectId, snapshotKey, snapshot, 
 }
 
 /* -------------------------------------------------------------------------- */
-/*  ROUTES                                                                     */
+/*  ROUTES                                                                    */
 /* -------------------------------------------------------------------------- */
 
-// Health
+// Root (matches what your prod backend already returns)
+app.get("/", (req, res) => res.send("album-backend OK"));
+
+// (Optional) Health endpoint for your own checks
 app.get("/health", (req, res) => res.json({ ok: true }));
 
-// IMPORTANT: this route is what your frontend error was calling.
-// If your backend already has /publish/:id.json, keep only ONE version.
+// Serve published snapshot wrapper (stored in S3)
 app.get("/publish/:shareId.json", async (req, res) => {
   try {
     const shareId = safe(req.params.shareId);
@@ -150,17 +164,16 @@ app.get("/publish/:shareId.json", async (req, res) => {
     const key = `public/publish/${shareId}.json`;
     const json = await readJson(key);
 
-    // Return the published snapshot artifact
     return res.json(json);
   } catch (e) {
     logErr(req, e);
-    // If missing, this should be 404 (not 500)
+    // Important: return 404 so the browser doesn't treat it like a crash
     return res.status(404).json({ ok: false, error: "NOT_FOUND" });
   }
 });
 
-// 1) ALIAS: Export.jsx calls /api/publish, backend previously had /api/publish-minisite
-app.post("/api/publish", async (req, res) => {
+// Core publisher (THIS is what your live prod uses)
+app.post("/api/publish-minisite", async (req, res) => {
   try {
     const projectId = safe(req.body?.projectId);
     let snapshotKey = safe(req.body?.snapshotKey);
@@ -179,7 +192,7 @@ app.post("/api/publish", async (req, res) => {
     const rawSnapshot = await readJson(snapshotKey);
     const cleanSnapshot = stripPlaybackUrls(rawSnapshot);
 
-    const shareId = rand(12);
+    const shareId = rand(24); // long id (your current prod returns 24 chars)
     const publicKey = `public/publish/${shareId}.json`;
 
     await putJson(publicKey, {
@@ -202,7 +215,51 @@ app.post("/api/publish", async (req, res) => {
   }
 });
 
-// 2) PUBLISHED MANIFEST: Player.jsx expects GET /api/published/:shareId
+// Alias (so any frontend calling /api/publish also works)
+app.post("/api/publish", async (req, res) => {
+  // Same behavior as /api/publish-minisite
+  try {
+    const projectId = safe(req.body?.projectId);
+    let snapshotKey = safe(req.body?.snapshotKey);
+
+    if (!projectId && !snapshotKey) {
+      return res.status(400).json({ ok: false, error: "MISSING_projectId_AND_snapshotKey" });
+    }
+
+    if (!snapshotKey) {
+      if (!projectId) return res.status(400).json({ ok: false, error: "MISSING_projectId" });
+      const meta = await readJson(`storage/projects/${projectId}/producer_returns/latest.json`);
+      snapshotKey = safe(meta?.latestSnapshotKey);
+      if (!snapshotKey) throw new Error("LATEST_snapshotKey_MISSING");
+    }
+
+    const rawSnapshot = await readJson(snapshotKey);
+    const cleanSnapshot = stripPlaybackUrls(rawSnapshot);
+
+    const shareId = rand(24);
+    const publicKey = `public/publish/${shareId}.json`;
+
+    await putJson(publicKey, {
+      shareId,
+      projectId: projectId || safe(cleanSnapshot?.projectId) || "",
+      snapshotKey,
+      snapshot: cleanSnapshot,
+      createdAt: new Date().toISOString(),
+    });
+
+    return res.json({
+      ok: true,
+      shareId,
+      snapshotKey,
+      publicUrl: `${req.protocol}://${req.get("host")}/publish/${shareId}.json`,
+    });
+  } catch (e) {
+    logErr(req, e);
+    return res.status(500).json({ ok: false, error: errString(e) });
+  }
+});
+
+// Optional manifest endpoint (useful if you want a stable player-facing shape)
 app.get("/api/published/:shareId", async (req, res) => {
   try {
     const shareId = safe(req.params.shareId);
@@ -223,25 +280,26 @@ app.get("/api/published/:shareId", async (req, res) => {
       publishedAt: pub?.createdAt || new Date().toISOString(),
     });
 
-    // Optional cache write
+    // Cache (non-fatal)
     const manifestKey = `public/manifests/${shareId}.json`;
     try {
       await putJson(manifestKey, manifest);
     } catch (e) {
-      console.warn("WARN: manifest cache write failed:", errString(e));
+      // ignore
     }
 
-    return res.json({ ok: true, shareId, manifest, manifestKey, manifestUrl: `/manifests/${shareId}.json` });
+    return res.json({ ok: true, shareId, manifest, manifestUrl: `/manifests/${shareId}.json` });
   } catch (e) {
     logErr(req, e);
     return res.status(404).json({ ok: false, error: errString(e) });
   }
 });
 
-// Optional: serve manifest cache
+// Optional: serve cached manifest
 app.get("/manifests/:shareId.json", async (req, res) => {
   try {
     const shareId = safe(req.params.shareId);
+    if (!shareId) return res.status(400).json({ ok: false, error: "MISSING_shareId" });
     const key = `public/manifests/${shareId}.json`;
     const json = await readJson(key);
     return res.json(json);
@@ -252,7 +310,7 @@ app.get("/manifests/:shareId.json", async (req, res) => {
 });
 
 /* -------------------------------------------------------------------------- */
-/*  START                                                                      */
+/*  START                                                                     */
 /* -------------------------------------------------------------------------- */
 
 const PORT = process.env.PORT || 3001;
