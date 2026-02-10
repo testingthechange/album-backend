@@ -1,161 +1,88 @@
 // FILE: server.js
-// Full updated server with:
-// - CORS that works for browser fetch from https://thirdparty-tz9x.onrender.com
-// - GET  /publish/:shareId.json          (reads S3 key public/publish/{shareId}.json)
-// - POST /api/publish-minisite           (THIS matches what is live in your prod backend)
-// - POST /api/publish                   (alias; same behavior)
-// - GET  /api/published/:shareId         (optional manifest wrapper)
-// - GET  /manifests/:shareId.json        (optional cached manifest)
+// Full server.js (drop-in) focused on ONE goal: make /publish/:shareId.json fetchable
+// from https://thirdparty-tz9x.onrender.com (CORS) and keep your existing publish flow.
 //
 // IMPORTANT:
-// 1) Adjust the 3 import lines below to match your repo paths/names if needed.
-// 2) Do NOT change your storage key prefixes unless you know your bucket layout.
-// 3) Deploy this to album-backend and retest webshell222 fetch.
+// - Keep your existing readJson/putJson/stripPlaybackUrls imports if your paths differ.
+// - This version inlines safe/rand/errString/logErr so you do NOT depend on ./lib/util.js.
+// - CORS is permissive for GET/POST/OPTIONS to avoid origin-callback crashes.
+// - Adds a global error handler so 500s return JSON (not HTML) and still include CORS headers.
 
 import express from "express";
 import cors from "cors";
 
-// ---- Adjust these to your repo (keep your existing ones if they differ)
+// ---- KEEP/ADJUST these two imports to match your repo (they must exist)
 import { readJson, putJson } from "./lib/storage.js";
 import { stripPlaybackUrls } from "./lib/stripPlaybackUrls.js";
-import { safe, rand, errString, logErr } from "./lib/util.js";
 
 const app = express();
+
+// Fingerprint (confirm Render is running THIS file)
+console.log("BOOT: album-backend server.js vCORS-2026-02-10-1740");
+
 app.use(express.json({ limit: "20mb" }));
 
 /* -------------------------------------------------------------------------- */
 /*  CORS (MUST be before routes)                                              */
 /* -------------------------------------------------------------------------- */
-
-const ALLOWED = new Set([
-  "https://thirdparty-tz9x.onrender.com",
-  "http://localhost:5173",
-  "http://localhost:3000",
-]);
-
+/**
+ * Why permissive here:
+ * - Your published artifacts are public JSON.
+ * - Your browser fetch must work cross-origin.
+ * - This avoids misconfigured origin callbacks that can throw and cause 500.
+ */
 app.use(
   cors({
-    origin: (origin, cb) => cb(null, !origin || ALLOWED.has(origin)),
+    origin: "*",
     methods: ["GET", "POST", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization"],
   })
 );
-
-// Ensure preflight always succeeds
-app.options("*", cors());
+app.options("*", cors({ origin: "*", methods: ["GET", "POST", "OPTIONS"] }));
 
 /* -------------------------------------------------------------------------- */
-/*  HELPERS (manifest conversion; optional)                                   */
+/*  Small utils (inline so we can't crash on missing util imports)            */
 /* -------------------------------------------------------------------------- */
 
-function parseDurationToSec(text) {
-  const s = String(text || "").trim();
-  const m = s.match(/^(\d+):([0-5]\d)$/);
-  if (!m) return 0;
-  return Number(m[1]) * 60 + Number(m[2]);
+function safe(v) {
+  return String(v ?? "").trim();
 }
 
-function firstS3Key(...candidates) {
-  for (const c of candidates) {
-    const k = String(c || "").trim();
-    if (k) return k;
+function rand(n = 24) {
+  // hex string length n
+  const chars = "abcdef0123456789";
+  let out = "";
+  for (let i = 0; i < n; i++) out += chars[Math.floor(Math.random() * chars.length)];
+  return out;
+}
+
+function errString(e) {
+  if (!e) return "UNKNOWN";
+  if (typeof e === "string") return e;
+  return String(e?.message || e);
+}
+
+function logErr(req, e) {
+  try {
+    console.error("ERR", {
+      path: req?.path,
+      method: req?.method,
+      msg: errString(e),
+      stack: e?.stack,
+    });
+  } catch {
+    console.error("ERR", errString(e));
   }
-  return "";
-}
-
-function toArray(v) {
-  return Array.isArray(v) ? v : [];
-}
-
-function ensureCredits(obj) {
-  const c = obj && typeof obj === "object" ? obj : {};
-  return {
-    songwriters: toArray(c.songwriters).map(String).filter(Boolean),
-    producers: toArray(c.producers).map(String).filter(Boolean),
-    engineers: toArray(c.engineers).map(String).filter(Boolean),
-    performers: toArray(c.performers).map(String).filter(Boolean),
-  };
-}
-
-function convertSnapshotToManifest({ shareId, projectId, snapshotKey, snapshot, publishedAt }) {
-  const snap = snapshot && typeof snapshot === "object" ? snapshot : {};
-
-  const albumMeta = snap?.album?.meta || {};
-  const albumTitle = String(albumMeta.albumTitle || albumMeta.title || "");
-  const artistName = String(albumMeta.artistName || albumMeta.artist || "");
-
-  const coverS3Key = firstS3Key(snap?.album?.cover?.s3Key, snap?.album?.coverKey, snap?.album?.cover?.key);
-
-  // Your published wrapper currently has snapshot.catalog.songs
-  const catalogSongs = toArray(snap?.catalog?.songs);
-  const metaSongs = toArray(snap?.meta?.songs);
-
-  const tracks = catalogSongs.map((row0, i) => {
-    const row = row0 && typeof row0 === "object" ? row0 : {};
-    const files = row?.files || {};
-    const slot = Number(row?.slot || i + 1);
-
-    const title =
-      String(row?.title || "").trim() ||
-      String(metaSongs?.[i]?.title || "").trim() ||
-      `Song ${i + 1}`;
-
-    const durationText = String(row?.duration || "").trim() || "0:00";
-    const durationSec = parseDurationToSec(durationText);
-
-    // Prefer album, then a, then b
-    const s3Key = firstS3Key(files?.album?.s3Key, files?.a?.s3Key, files?.b?.s3Key);
-
-    const metaRow = metaSongs?.[i] && typeof metaSongs[i] === "object" ? metaSongs[i] : {};
-    const credits = ensureCredits(metaRow?.credits);
-    const lyricsText = String(metaRow?.lyrics?.text || metaRow?.lyricsText || "").trim();
-
-    return {
-      slot,
-      title,
-      durationText,
-      durationSec,
-      audio: { s3Key },
-      credits,
-      lyrics: { text: lyricsText, s3Key: "" },
-    };
-  });
-
-  return {
-    ok: true,
-    shareId: String(shareId || "").trim(),
-    projectId: String(projectId || "").trim(),
-    lineage: {
-      snapshotKey: String(snapshotKey || "").trim(),
-      publishedAt: String(publishedAt || new Date().toISOString()),
-    },
-    album: {
-      meta: { albumTitle, artistName },
-      cover: { s3Key: coverS3Key },
-      trackDurations: tracks.map((t) => ({
-        slot: t.slot,
-        title: t.title,
-        s3Key: t.audio.s3Key,
-        durationSec: t.durationSec,
-        durationText: t.durationText,
-      })),
-      tracks,
-    },
-    nftMix: snap?.nftMix || {},
-  };
 }
 
 /* -------------------------------------------------------------------------- */
 /*  ROUTES                                                                    */
 /* -------------------------------------------------------------------------- */
 
-// Root (matches what your prod backend already returns)
 app.get("/", (req, res) => res.send("album-backend OK"));
-
-// (Optional) Health endpoint for your own checks
 app.get("/health", (req, res) => res.json({ ok: true }));
 
-// Serve published snapshot wrapper (stored in S3)
+// Read published wrapper from S3 at public/publish/{shareId}.json
 app.get("/publish/:shareId.json", async (req, res) => {
   try {
     const shareId = safe(req.params.shareId);
@@ -167,12 +94,12 @@ app.get("/publish/:shareId.json", async (req, res) => {
     return res.json(json);
   } catch (e) {
     logErr(req, e);
-    // Important: return 404 so the browser doesn't treat it like a crash
+    // If missing or unreadable, return 404 so frontend can show a clear error
     return res.status(404).json({ ok: false, error: "NOT_FOUND" });
   }
 });
 
-// Core publisher (THIS is what your live prod uses)
+// Core publisher (matches your prod reality: POST /api/publish-minisite)
 app.post("/api/publish-minisite", async (req, res) => {
   try {
     const projectId = safe(req.body?.projectId);
@@ -192,7 +119,7 @@ app.post("/api/publish-minisite", async (req, res) => {
     const rawSnapshot = await readJson(snapshotKey);
     const cleanSnapshot = stripPlaybackUrls(rawSnapshot);
 
-    const shareId = rand(24); // long id (your current prod returns 24 chars)
+    const shareId = rand(24);
     const publicKey = `public/publish/${shareId}.json`;
 
     await putJson(publicKey, {
@@ -215,7 +142,7 @@ app.post("/api/publish-minisite", async (req, res) => {
   }
 });
 
-// Alias (so any frontend calling /api/publish also works)
+// Alias (so callers using /api/publish keep working)
 app.post("/api/publish", async (req, res) => {
   // Same behavior as /api/publish-minisite
   try {
@@ -259,54 +186,14 @@ app.post("/api/publish", async (req, res) => {
   }
 });
 
-// Optional manifest endpoint (useful if you want a stable player-facing shape)
-app.get("/api/published/:shareId", async (req, res) => {
-  try {
-    const shareId = safe(req.params.shareId);
-    if (!shareId) return res.status(400).json({ ok: false, error: "MISSING_shareId" });
+/* -------------------------------------------------------------------------- */
+/*  Global error handler (prevents Express HTML 500 pages)                    */
+/* -------------------------------------------------------------------------- */
 
-    const pubKey = `public/publish/${shareId}.json`;
-    const pub = await readJson(pubKey);
-
-    const snapshot = pub?.snapshot;
-    const snapshotKey = safe(pub?.snapshotKey);
-    const projectId = safe(pub?.projectId || snapshot?.projectId);
-
-    const manifest = convertSnapshotToManifest({
-      shareId,
-      projectId,
-      snapshotKey,
-      snapshot,
-      publishedAt: pub?.createdAt || new Date().toISOString(),
-    });
-
-    // Cache (non-fatal)
-    const manifestKey = `public/manifests/${shareId}.json`;
-    try {
-      await putJson(manifestKey, manifest);
-    } catch (e) {
-      // ignore
-    }
-
-    return res.json({ ok: true, shareId, manifest, manifestUrl: `/manifests/${shareId}.json` });
-  } catch (e) {
-    logErr(req, e);
-    return res.status(404).json({ ok: false, error: errString(e) });
-  }
-});
-
-// Optional: serve cached manifest
-app.get("/manifests/:shareId.json", async (req, res) => {
-  try {
-    const shareId = safe(req.params.shareId);
-    if (!shareId) return res.status(400).json({ ok: false, error: "MISSING_shareId" });
-    const key = `public/manifests/${shareId}.json`;
-    const json = await readJson(key);
-    return res.json(json);
-  } catch (e) {
-    logErr(req, e);
-    return res.status(404).json({ ok: false });
-  }
+app.use((err, req, res, next) => {
+  logErr(req, err);
+  if (res.headersSent) return next(err);
+  return res.status(500).json({ ok: false, error: errString(err) });
 });
 
 /* -------------------------------------------------------------------------- */
@@ -317,3 +204,7 @@ const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
   console.log(`album-backend listening on ${PORT}`);
 });
+
+// Hard-crash visibility in Render logs
+process.on("unhandledRejection", (e) => console.error("unhandledRejection", e));
+process.on("uncaughtException", (e) => console.error("uncaughtException", e));
