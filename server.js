@@ -1,14 +1,10 @@
 // FILE: server.js
-// Full server.js (drop-in) focused on ONE goal: make /publish/:shareId.json fetchable
-// from https://thirdparty-tz9x.onrender.com (CORS) and keep your existing publish flow.
-//
-// IMPORTANT:
-// - Keep your existing readJson/putJson/stripPlaybackUrls imports if your paths differ.
-// - This version inlines safe/rand/errString/logErr so you do NOT depend on ./lib/util.js.
-// - CORS is permissive for GET/POST/OPTIONS to avoid origin-callback crashes.
-// - Adds a global error handler so 500s return JSON (not HTML) and still include CORS headers.
+// Goal: make /publish/:shareId.json fetchable from https://thirdparty-tz9x.onrender.com.
+// This version DOES NOT rely on the cors package for the critical header.
+// It FORCE-SETS CORS headers for allowed origins (and handles OPTIONS) before any routes.
 
 import express from "express";
+// cors import can stay, but we are not relying on it for the critical header
 import cors from "cors";
 
 // ---- KEEP/ADJUST these two imports to match your repo (they must exist)
@@ -18,27 +14,52 @@ import { stripPlaybackUrls } from "./lib/stripPlaybackUrls.js";
 const app = express();
 
 // Fingerprint (confirm Render is running THIS file)
-console.log("BOOT: album-backend server.js vCORS-2026-02-10-1740");
+console.log("BOOT: album-backend server.js vCORS-FORCED-2026-02-10-1758");
 
 app.use(express.json({ limit: "20mb" }));
 
 /* -------------------------------------------------------------------------- */
-/*  CORS (MUST be before routes)                                              */
+/*  FORCED CORS (MUST be before routes)                                       */
 /* -------------------------------------------------------------------------- */
 /**
- * Why permissive here:
- * - Your published artifacts are public JSON.
- * - Your browser fetch must work cross-origin.
- * - This avoids misconfigured origin callbacks that can throw and cause 500.
+ * Your curl test proved ACAO is missing when Origin is present.
+ * This middleware hard-sets the headers for known origins so browser fetch works.
+ */
+const ALLOWED_ORIGINS = new Set([
+  "https://thirdparty-tz9x.onrender.com",
+  "http://localhost:5173",
+  "http://localhost:3000",
+]);
+
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+
+  if (origin && ALLOWED_ORIGINS.has(origin)) {
+    res.setHeader("Access-Control-Allow-Origin", origin);
+    res.setHeader("Vary", "Origin");
+  }
+
+  // Always set these (safe)
+  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+
+  // Preflight
+  if (req.method === "OPTIONS") return res.sendStatus(204);
+
+  next();
+});
+
+/**
+ * Keep cors() as a non-critical helper (optional).
+ * If it ever behaves oddly, the forced headers above still make the browser work.
  */
 app.use(
   cors({
-    origin: "*",
+    origin: (origin, cb) => cb(null, !origin || ALLOWED_ORIGINS.has(origin)),
     methods: ["GET", "POST", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization"],
   })
 );
-app.options("*", cors({ origin: "*", methods: ["GET", "POST", "OPTIONS"] }));
 
 /* -------------------------------------------------------------------------- */
 /*  Small utils (inline so we can't crash on missing util imports)            */
@@ -49,7 +70,6 @@ function safe(v) {
 }
 
 function rand(n = 24) {
-  // hex string length n
   const chars = "abcdef0123456789";
   let out = "";
   for (let i = 0; i < n; i++) out += chars[Math.floor(Math.random() * chars.length)];
@@ -94,7 +114,6 @@ app.get("/publish/:shareId.json", async (req, res) => {
     return res.json(json);
   } catch (e) {
     logErr(req, e);
-    // If missing or unreadable, return 404 so frontend can show a clear error
     return res.status(404).json({ ok: false, error: "NOT_FOUND" });
   }
 });
@@ -144,7 +163,6 @@ app.post("/api/publish-minisite", async (req, res) => {
 
 // Alias (so callers using /api/publish keep working)
 app.post("/api/publish", async (req, res) => {
-  // Same behavior as /api/publish-minisite
   try {
     const projectId = safe(req.body?.projectId);
     let snapshotKey = safe(req.body?.snapshotKey);
@@ -187,7 +205,7 @@ app.post("/api/publish", async (req, res) => {
 });
 
 /* -------------------------------------------------------------------------- */
-/*  Global error handler (prevents Express HTML 500 pages)                    */
+/*  Global error handler                                                      */
 /* -------------------------------------------------------------------------- */
 
 app.use((err, req, res, next) => {
@@ -205,6 +223,5 @@ app.listen(PORT, () => {
   console.log(`album-backend listening on ${PORT}`);
 });
 
-// Hard-crash visibility in Render logs
 process.on("unhandledRejection", (e) => console.error("unhandledRejection", e));
 process.on("uncaughtException", (e) => console.error("uncaughtException", e));
