@@ -1,26 +1,14 @@
 // FILE: server.js
-// Updated drop-in server.js (robust) with your base + ONE missing piece that blocks playback:
-//
-// ✅ Adds GET /api/playback-url?s3Key=...  -> returns { ok:true, url, playbackUrl }
-//    so webshell222 can sign audio + cover URLs and actually play.
-//
-// Keeps:
-// - Forced CORS for every response (incl errors) + OPTIONS=204
-// - Async route wrapper + JSON error handler (no HTML 500 pages)
-// - Inline S3 read/write (no ./lib deps)
-// - /publish/:shareId.json
-// - /api/publish-minisite and /api/publish alias
-//
-// Required env (match whatever you already use in Render):
-// - S3_BUCKET  (preferred) OR BUCKET OR AWS_S3_BUCKET OR S3_BUCKET_NAME
-// - AWS_REGION (or AWS_DEFAULT_REGION). If absent, defaults to us-west-1.
+// ✅ Added: Resend-based magic link email send endpoint
+// Keeps: your existing CORS + S3 publish + /api/playback-url signing
 
 import express from "express";
 import { S3Client, GetObjectCommand, PutObjectCommand } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
+import { Resend } from "resend";
 
 const app = express();
-console.log("BOOT: album-backend server.js vINLINE-S3-CORS-ERRWRAP-SIGN-2026-02-10-1845");
+console.log("BOOT: album-backend server.js vINLINE-S3-CORS-ERRWRAP-SIGN-RESEND-2026-02-11");
 
 app.use(express.json({ limit: "20mb" }));
 
@@ -160,13 +148,7 @@ function stripPlaybackUrls(obj) {
     }
 
     for (const k of Object.keys(x)) {
-      if (
-        k === "playbackUrl" ||
-        k === "playbackURL" ||
-        k === "url" ||
-        k === "urls" ||
-        k === "previewUrl"
-      ) {
+      if (k === "playbackUrl" || k === "playbackURL" || k === "url" || k === "urls" || k === "previewUrl") {
         delete x[k];
         continue;
       }
@@ -180,6 +162,33 @@ function stripPlaybackUrls(obj) {
 }
 
 /* -------------------------------------------------------------------------- */
+/*  EMAIL (RESEND)                                                            */
+/* -------------------------------------------------------------------------- */
+
+// Env vars expected:
+// RESEND_API_KEY=...
+// MAIL_FROM="Blackout <noreply@yourdomain.com>"   (must be verified in Resend)
+// APP_BASE_URL=https://your-frontend.com          (or http://localhost:5173)
+
+const RESEND_API_KEY = safe(process.env.RESEND_API_KEY);
+const MAIL_FROM = safe(process.env.MAIL_FROM) || safe(process.env.RESEND_FROM);
+const APP_BASE_URL = safe(process.env.APP_BASE_URL) || "http://localhost:5173";
+
+const resend = RESEND_API_KEY ? new Resend(RESEND_API_KEY) : null;
+
+function isEmail(s) {
+  const v = safe(s);
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v);
+}
+
+function buildMagicLinkUrl({ projectId, token }) {
+  const pid = encodeURIComponent(safe(projectId));
+  const t = encodeURIComponent(safe(token));
+  // producer shell route: adjust if your app uses a different path
+  return `${APP_BASE_URL}/producer?projectId=${pid}&token=${t}`;
+}
+
+/* -------------------------------------------------------------------------- */
 /*  ROUTES                                                                    */
 /* -------------------------------------------------------------------------- */
 
@@ -188,7 +197,13 @@ app.get("/", (req, res) => res.send("album-backend OK"));
 app.get(
   "/health",
   wrap(async (req, res) => {
-    res.json({ ok: true, region: AWS_REGION, bucketConfigured: !!S3_BUCKET });
+    res.json({
+      ok: true,
+      region: AWS_REGION,
+      bucketConfigured: !!S3_BUCKET,
+      resendConfigured: !!(RESEND_API_KEY && MAIL_FROM),
+      appBaseUrl: APP_BASE_URL,
+    });
   })
 );
 
@@ -208,13 +223,90 @@ app.get(
 
     const expiresIn = 60 * 20; // 20 minutes
 
-    const url = await getSignedUrl(
-      s3,
-      new GetObjectCommand({ Bucket: S3_BUCKET, Key: s3Key }),
-      { expiresIn }
-    );
+    const url = await getSignedUrl(s3, new GetObjectCommand({ Bucket: S3_BUCKET, Key: s3Key }), { expiresIn });
 
     return res.json({ ok: true, s3Key, url, playbackUrl: url, expiresIn });
+  })
+);
+
+/**
+ * ✅ SEND MAGIC LINK EMAIL (BETA)
+ * POST /api/magic-link/send
+ * body: { to, projectId, producerName? }
+ *
+ * NOTE:
+ * - This does NOT create any project data.
+ * - It only creates a token + stores a minimal record in S3 so you can validate later.
+ */
+app.post(
+  "/api/magic-link/send",
+  wrap(async (req, res) => {
+    const to = safe(req.body?.to);
+    const projectId = safe(req.body?.projectId);
+    const producerName = safe(req.body?.producerName);
+
+    if (!to || !isEmail(to)) return res.status(400).json({ ok: false, error: "INVALID_to" });
+    if (!projectId) return res.status(400).json({ ok: false, error: "MISSING_projectId" });
+
+    if (!resend || !RESEND_API_KEY) return res.status(500).json({ ok: false, error: "MISSING_RESEND_API_KEY" });
+    if (!MAIL_FROM) return res.status(500).json({ ok: false, error: "MISSING_MAIL_FROM" });
+
+    // token + storage (so you can validate later if you want)
+    const token = randHex(32);
+    const createdAt = new Date().toISOString();
+
+    // Store token record (optional but recommended)
+    // You can later use this to validate producer sessions.
+    const tokenKey = `storage/projects/${projectId}/magic_links/${token}.json`;
+    await putJson(tokenKey, {
+      projectId,
+      token,
+      to,
+      producerName,
+      createdAt,
+      status: "sent",
+      appBaseUrl: APP_BASE_URL,
+    });
+
+    const url = buildMagicLinkUrl({ projectId, token });
+
+    const subject = `Your producer link${projectId ? ` (Project ${projectId})` : ""}`;
+    const greeting = producerName ? `Hi ${producerName},` : "Hi,";
+    const text = `${greeting}
+
+Here’s your secure producer link:
+${url}
+
+If you didn’t request this, you can ignore this email.`;
+
+    const html = `
+      <div style="font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial;">
+        <p>${greeting}</p>
+        <p>Here’s your secure producer link:</p>
+        <p><a href="${url}" style="font-weight:700;">Open Producer Link</a></p>
+        <p style="opacity:.8; font-size:12px; word-break:break-all;">${url}</p>
+        <hr style="border:none; border-top:1px solid #eee; margin:16px 0;" />
+        <p style="opacity:.7; font-size:12px;">If you didn’t request this, you can ignore this email.</p>
+      </div>
+    `;
+
+    const out = await resend.emails.send({
+      from: MAIL_FROM,
+      to,
+      subject,
+      text,
+      html,
+    });
+
+    return res.json({
+      ok: true,
+      projectId,
+      to,
+      producerName: producerName || "",
+      token,
+      url,
+      resendId: safe(out?.data?.id || ""),
+    });
   })
 );
 
@@ -326,12 +418,7 @@ app.use((err, req, res, next) => {
 
   const msg = errString(err);
 
-  if (
-    msg.includes("NoSuchKey") ||
-    msg.includes("NotFound") ||
-    msg.includes("404") ||
-    msg.includes("NOT_FOUND")
-  ) {
+  if (msg.includes("NoSuchKey") || msg.includes("NotFound") || msg.includes("404") || msg.includes("NOT_FOUND")) {
     return res.status(404).json({ ok: false, error: "NOT_FOUND" });
   }
 
