@@ -4,7 +4,6 @@
 import express from "express";
 import { S3Client, GetObjectCommand, PutObjectCommand } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
-console.log("SERVER FILE PATH:", new URL(import.meta.url).pathname);
 
 const app = express();
 console.log("BOOT: album-backend server.js vMAGICLINK-RESEND-S3-SIGN-2026-02-11");
@@ -28,8 +27,7 @@ const S3_BUCKET = envFirst("S3_BUCKET", "BUCKET", "AWS_S3_BUCKET", "S3_BUCKET_NA
 
 const RESEND_API_KEY = envFirst("RESEND_API_KEY");
 const MAIL_FROM = envFirst("MAIL_FROM") || "Blackout <noreply@smartb4email.onrender.com>";
-const APP_BASE_URL =
-  envFirst("APP_BASE_URL") || "https://smartb4email.onrender.com"; // beta base (NOT localhost)
+const APP_BASE_URL = (envFirst("APP_BASE_URL") || "https://smartb4email.onrender.com").replace(/\/+$/, "");
 
 /* -------------------------------------------------------------------------- */
 /*  CORS                                                                       */
@@ -106,7 +104,6 @@ const s3 = new S3Client({ region: AWS_REGION });
 async function streamToString(body) {
   if (!body) return "";
   if (typeof body.transformToString === "function") return await body.transformToString();
-
   return await new Promise((resolve, reject) => {
     const chunks = [];
     body.on("data", (c) => chunks.push(Buffer.from(c)));
@@ -142,7 +139,6 @@ async function putJson(key, obj) {
 
 function stripPlaybackUrls(obj) {
   const seen = new WeakSet();
-
   function walk(x) {
     if (!x || typeof x !== "object") return x;
     if (seen.has(x)) return x;
@@ -152,7 +148,6 @@ function stripPlaybackUrls(obj) {
       for (const v of x) walk(v);
       return x;
     }
-
     for (const k of Object.keys(x)) {
       if (k === "playbackUrl" || k === "playbackURL" || k === "url" || k === "urls" || k === "previewUrl") {
         delete x[k];
@@ -162,7 +157,6 @@ function stripPlaybackUrls(obj) {
     }
     return x;
   }
-
   const clone = JSON.parse(JSON.stringify(obj || {}));
   return walk(clone);
 }
@@ -197,20 +191,13 @@ async function sendResendEmail({ to, subject, html }) {
 /*  ROUTES                                                                     */
 /* -------------------------------------------------------------------------- */
 
-app.get("/", (req, res) => res.send("album-backend OK"));
+app.get("/", (req, res) => res.type("text").send("album-backend OK. Try /api/health or /publish/<shareId>.json"));
 
-app.get(
-  "/health",
-  wrap(async (req, res) => {
-    res.json({
-      ok: true,
-      region: AWS_REGION,
-      bucketConfigured: !!S3_BUCKET,
-      resendConfigured: !!RESEND_API_KEY,
-      appBaseUrl: APP_BASE_URL,
-    });
-  })
-);
+// Keep your existing endpoint
+app.get("/api/health", (req, res) => res.json({ ok: true, service: "album-backend" }));
+
+// Alias to reduce confusion
+app.get("/health", (req, res) => res.redirect(302, "/api/health"));
 
 /**
  * Signed playback URL for audio + cover.
@@ -249,14 +236,23 @@ app.post(
     const createdAt = new Date().toISOString();
     const expiresAt = new Date(Date.now() + Math.max(5, expiresInMinutes) * 60 * 1000).toISOString();
 
-    const magicLinkUrl = `${APP_BASE_URL.replace(/\/+$/, "")}/minisite?projectId=${encodeURIComponent(
-      projectId
-    )}&token=${encodeURIComponent(token)}`;
+    const magicLinkUrl = `${APP_BASE_URL}/minisite?projectId=${encodeURIComponent(projectId)}&token=${encodeURIComponent(
+      token
+    )}`;
 
-    // Record token in S3 so minisite can validate later (even if you don’t use it yet)
-    // You can extend later: status, consumedAt, etc.
-    const tokenKey = `storage/projects/${projectId}/magic_links/${token}.json`;
-    await putJson(tokenKey, { projectId, to, token, createdAt, expiresAt, status: "active" });
+    // Record token in S3 so minisite can validate later.
+    // If S3 isn't configured yet, still send the email and return a warning.
+    let tokenKey = "";
+    let tokenStored = false;
+    let tokenStoreWarning = "";
+
+    if (S3_BUCKET) {
+      tokenKey = `storage/projects/${projectId}/magic_links/${token}.json`;
+      await putJson(tokenKey, { projectId, to, token, createdAt, expiresAt, status: "active" });
+      tokenStored = true;
+    } else {
+      tokenStoreWarning = "S3_BUCKET missing; token not stored (email still sent).";
+    }
 
     const subject = `Your Blackout Producer Link (${projectId})`;
     const html = `
@@ -284,18 +280,20 @@ app.post(
       to,
       projectId,
       token,
-      tokenKey,
       magicLinkUrl,
       createdAt,
       expiresAt,
       dryRun,
+      tokenStored,
+      tokenKey,
+      tokenStoreWarning,
       resendResult,
     });
   })
 );
 
 /**
- * Publish endpoints (unchanged behavior)
+ * Publish endpoints (kept)
  */
 app.get(
   "/publish/:shareId.json",
@@ -315,9 +313,7 @@ app.post(
     const projectId = safe(req.body?.projectId);
     let snapshotKey = safe(req.body?.snapshotKey);
 
-    if (!projectId && !snapshotKey) {
-      return res.status(400).json({ ok: false, error: "MISSING_projectId_AND_snapshotKey" });
-    }
+    if (!projectId && !snapshotKey) return res.status(400).json({ ok: false, error: "MISSING_projectId_AND_snapshotKey" });
 
     if (!snapshotKey) {
       const metaKey = `storage/projects/${projectId}/producer_returns/latest.json`;
@@ -349,7 +345,6 @@ app.post(
   })
 );
 
-// Alias
 app.post("/api/publish", (req, res, next) => app._router.handle(req, res, next));
 
 /* -------------------------------------------------------------------------- */
@@ -366,7 +361,6 @@ app.use((err, req, res, next) => {
   try {
     applyCors(req, res);
   } catch {}
-
   if (res.headersSent) return next(err);
 
   const msg = errString(err);
@@ -378,8 +372,5 @@ app.use((err, req, res, next) => {
 /*  START                                                                      */
 /* -------------------------------------------------------------------------- */
 
-const PORT = Number(process.env.PORT || 3001);
+const PORT = Number(process.env.PORT || 3002);
 app.listen(PORT, () => console.log(`album-backend listening on ${PORT}`));
-
-process.on("unhandledRejection", (e) => console.error("unhandledRejection", e));
-process.on("uncaughtException", (e) => console.error("uncaughtException", e));
