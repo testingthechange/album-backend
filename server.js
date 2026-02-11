@@ -26,6 +26,8 @@ const AWS_REGION = envFirst("AWS_REGION", "AWS_DEFAULT_REGION") || "us-west-1";
 const S3_BUCKET = envFirst("S3_BUCKET", "BUCKET", "AWS_S3_BUCKET", "S3_BUCKET_NAME");
 
 const RESEND_API_KEY = envFirst("RESEND_API_KEY");
+// IMPORTANT: Resend will only allow verified senders/domains.
+// Use dryRun:true until you set a verified MAIL_FROM.
 const MAIL_FROM = envFirst("MAIL_FROM") || "Blackout <noreply@smartb4email.onrender.com>";
 const APP_BASE_URL = (envFirst("APP_BASE_URL") || "https://smartb4email.onrender.com").replace(/\/+$/, "");
 
@@ -193,8 +195,16 @@ async function sendResendEmail({ to, subject, html }) {
 
 app.get("/", (req, res) => res.type("text").send("album-backend OK. Try /api/health or /publish/<shareId>.json"));
 
-// Keep your existing endpoint
-app.get("/api/health", (req, res) => res.json({ ok: true, service: "album-backend" }));
+app.get("/api/health", (req, res) =>
+  res.json({
+    ok: true,
+    service: "album-backend",
+    bucketConfigured: !!S3_BUCKET,
+    resendConfigured: !!RESEND_API_KEY,
+    mailFromConfigured: !!safe(MAIL_FROM),
+    appBaseUrl: APP_BASE_URL,
+  })
+);
 
 // Alias to reduce confusion
 app.get("/health", (req, res) => res.redirect(302, "/api/health"));
@@ -241,7 +251,7 @@ app.post(
     )}`;
 
     // Record token in S3 so minisite can validate later.
-    // If S3 isn't configured yet, still send the email and return a warning.
+    // If S3 isn't configured yet, still return the URL (and optionally send email).
     let tokenKey = "";
     let tokenStored = false;
     let tokenStoreWarning = "";
@@ -251,7 +261,7 @@ app.post(
       await putJson(tokenKey, { projectId, to, token, createdAt, expiresAt, status: "active" });
       tokenStored = true;
     } else {
-      tokenStoreWarning = "S3_BUCKET missing; token not stored (email still sent).";
+      tokenStoreWarning = "S3_BUCKET missing; token not stored.";
     }
 
     const subject = `Your Blackout Producer Link (${projectId})`;
@@ -287,13 +297,15 @@ app.post(
       tokenStored,
       tokenKey,
       tokenStoreWarning,
+      resendConfigured: !!RESEND_API_KEY,
+      mailFromConfigured: !!safe(MAIL_FROM),
       resendResult,
     });
   })
 );
 
 /**
- * Publish endpoints (kept)
+ * Publish endpoints
  */
 app.get(
   "/publish/:shareId.json",
@@ -307,45 +319,43 @@ app.get(
   })
 );
 
-app.post(
-  "/api/publish-minisite",
-  wrap(async (req, res) => {
-    const projectId = safe(req.body?.projectId);
-    let snapshotKey = safe(req.body?.snapshotKey);
+async function handlePublish(req, res) {
+  const projectId = safe(req.body?.projectId);
+  let snapshotKey = safe(req.body?.snapshotKey);
 
-    if (!projectId && !snapshotKey) return res.status(400).json({ ok: false, error: "MISSING_projectId_AND_snapshotKey" });
+  if (!projectId && !snapshotKey) return res.status(400).json({ ok: false, error: "MISSING_projectId_AND_snapshotKey" });
 
-    if (!snapshotKey) {
-      const metaKey = `storage/projects/${projectId}/producer_returns/latest.json`;
-      const meta = await readJson(metaKey);
-      snapshotKey = safe(meta?.latestSnapshotKey);
-      if (!snapshotKey) throw new Error("LATEST_snapshotKey_MISSING");
-    }
+  if (!snapshotKey) {
+    const metaKey = `storage/projects/${projectId}/producer_returns/latest.json`;
+    const meta = await readJson(metaKey);
+    snapshotKey = safe(meta?.latestSnapshotKey);
+    if (!snapshotKey) throw new Error("LATEST_snapshotKey_MISSING");
+  }
 
-    const rawSnapshot = await readJson(snapshotKey);
-    const cleanSnapshot = stripPlaybackUrls(rawSnapshot);
+  const rawSnapshot = await readJson(snapshotKey);
+  const cleanSnapshot = stripPlaybackUrls(rawSnapshot);
 
-    const shareId = randHex(24);
-    const publicKey = `public/publish/${shareId}.json`;
+  const shareId = randHex(24);
+  const publicKey = `public/publish/${shareId}.json`;
 
-    await putJson(publicKey, {
-      shareId,
-      projectId: projectId || safe(cleanSnapshot?.projectId) || "",
-      snapshotKey,
-      snapshot: cleanSnapshot,
-      createdAt: new Date().toISOString(),
-    });
+  await putJson(publicKey, {
+    shareId,
+    projectId: projectId || safe(cleanSnapshot?.projectId) || "",
+    snapshotKey,
+    snapshot: cleanSnapshot,
+    createdAt: new Date().toISOString(),
+  });
 
-    res.json({
-      ok: true,
-      shareId,
-      snapshotKey,
-      publicUrl: `${req.protocol}://${req.get("host")}/publish/${shareId}.json`,
-    });
-  })
-);
+  return res.json({
+    ok: true,
+    shareId,
+    snapshotKey,
+    publicUrl: `${req.protocol}://${req.get("host")}/publish/${shareId}.json`,
+  });
+}
 
-app.post("/api/publish", (req, res, next) => app._router.handle(req, res, next));
+app.post("/api/publish-minisite", wrap(handlePublish));
+app.post("/api/publish", wrap(handlePublish));
 
 /* -------------------------------------------------------------------------- */
 /*  404 + JSON error handler                                                   */
@@ -374,3 +384,6 @@ app.use((err, req, res, next) => {
 
 const PORT = Number(process.env.PORT || 3002);
 app.listen(PORT, () => console.log(`album-backend listening on ${PORT}`));
+
+process.on("unhandledRejection", (e) => console.error("unhandledRejection", e));
+process.on("uncaughtException", (e) => console.error("uncaughtException", e));
