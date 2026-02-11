@@ -1,36 +1,52 @@
 // FILE: server.js
-// ✅ Added: Resend-based magic link email send endpoint
-// Keeps: your existing CORS + S3 publish + /api/playback-url signing
+// album-backend server.js (CORS + JSON errors + S3 + signed playback + publish + magic-link via Resend)
 
 import express from "express";
 import { S3Client, GetObjectCommand, PutObjectCommand } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
-import { Resend } from "resend";
 
 const app = express();
-console.log("BOOT: album-backend server.js vINLINE-S3-CORS-ERRWRAP-SIGN-RESEND-2026-02-11");
+console.log("BOOT: album-backend server.js vMAGICLINK-RESEND-S3-SIGN-2026-02-11");
 
 app.use(express.json({ limit: "20mb" }));
 
 /* -------------------------------------------------------------------------- */
-/*  CORS (FORCE for every response, including errors)                         */
+/*  ENV                                                                        */
+/* -------------------------------------------------------------------------- */
+
+function envFirst(...keys) {
+  for (const k of keys) {
+    const v = String(process.env[k] || "").trim();
+    if (v) return v;
+  }
+  return "";
+}
+
+const AWS_REGION = envFirst("AWS_REGION", "AWS_DEFAULT_REGION") || "us-west-1";
+const S3_BUCKET = envFirst("S3_BUCKET", "BUCKET", "AWS_S3_BUCKET", "S3_BUCKET_NAME");
+
+const RESEND_API_KEY = envFirst("RESEND_API_KEY");
+const MAIL_FROM = envFirst("MAIL_FROM") || "Blackout <noreply@smartb4email.onrender.com>";
+const APP_BASE_URL =
+  envFirst("APP_BASE_URL") || "https://smartb4email.onrender.com"; // beta base (NOT localhost)
+
+/* -------------------------------------------------------------------------- */
+/*  CORS                                                                       */
 /* -------------------------------------------------------------------------- */
 
 const ALLOWED_ORIGINS = new Set([
-  "https://thirdparty-tz9x.onrender.com",
+  "https://smartb4email.onrender.com",
   "http://localhost:5173",
   "http://localhost:3000",
 ]);
 
 function applyCors(req, res) {
   const origin = req.headers.origin;
-
   if (origin && ALLOWED_ORIGINS.has(origin)) {
     res.setHeader("Access-Control-Allow-Origin", origin);
     res.setHeader("Vary", "Origin");
   }
-
-  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  res.setHeader("Access-Control-Allow-Methods", "GET,POST,PATCH,DELETE,OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
 }
 
@@ -41,14 +57,14 @@ app.use((req, res, next) => {
 });
 
 /* -------------------------------------------------------------------------- */
-/*  Small utils                                                               */
+/*  Small utils                                                                */
 /* -------------------------------------------------------------------------- */
 
 function safe(v) {
   return String(v ?? "").trim();
 }
 
-function randHex(n = 24) {
+function randHex(n = 32) {
   const chars = "abcdef0123456789";
   let out = "";
   for (let i = 0; i < n; i++) out += chars[Math.floor(Math.random() * chars.length)];
@@ -77,19 +93,8 @@ function logErr(req, e) {
 const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
 
 /* -------------------------------------------------------------------------- */
-/*  AWS / S3                                                                  */
+/*  AWS / S3                                                                   */
 /* -------------------------------------------------------------------------- */
-
-function envFirst(...keys) {
-  for (const k of keys) {
-    const v = String(process.env[k] || "").trim();
-    if (v) return v;
-  }
-  return "";
-}
-
-const AWS_REGION = envFirst("AWS_REGION", "AWS_DEFAULT_REGION") || "us-west-1";
-const S3_BUCKET = envFirst("S3_BUCKET", "BUCKET", "AWS_S3_BUCKET", "S3_BUCKET_NAME");
 
 if (!S3_BUCKET) {
   console.warn("WARN: Missing bucket env var. Set S3_BUCKET (or BUCKET/AWS_S3_BUCKET/S3_BUCKET_NAME).");
@@ -130,10 +135,10 @@ async function putJson(key, obj) {
   );
 }
 
-/**
- * Minimal strip: remove obvious signed-url fields (keeps s3Key and data).
- * Also removes previewUrl to avoid publishing already-signed S3 URLs.
- */
+/* -------------------------------------------------------------------------- */
+/*  Publish scrub                                                              */
+/* -------------------------------------------------------------------------- */
+
 function stripPlaybackUrls(obj) {
   const seen = new WeakSet();
 
@@ -162,34 +167,33 @@ function stripPlaybackUrls(obj) {
 }
 
 /* -------------------------------------------------------------------------- */
-/*  EMAIL (RESEND)                                                            */
+/*  Resend                                                                     */
 /* -------------------------------------------------------------------------- */
 
-// Env vars expected:
-// RESEND_API_KEY=...
-// MAIL_FROM="Blackout <noreply@yourdomain.com>"   (must be verified in Resend)
-// APP_BASE_URL=https://your-frontend.com          (or http://localhost:5173)
+async function sendResendEmail({ to, subject, html }) {
+  if (!RESEND_API_KEY) throw new Error("MISSING_RESEND_API_KEY");
 
-const RESEND_API_KEY = safe(process.env.RESEND_API_KEY);
-const MAIL_FROM = safe(process.env.MAIL_FROM) || safe(process.env.RESEND_FROM);
-const APP_BASE_URL = safe(process.env.APP_BASE_URL) || "http://localhost:5173";
+  const r = await fetch("https://api.resend.com/emails", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${RESEND_API_KEY}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      from: MAIL_FROM,
+      to,
+      subject,
+      html,
+    }),
+  });
 
-const resend = RESEND_API_KEY ? new Resend(RESEND_API_KEY) : null;
-
-function isEmail(s) {
-  const v = safe(s);
-  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v);
-}
-
-function buildMagicLinkUrl({ projectId, token }) {
-  const pid = encodeURIComponent(safe(projectId));
-  const t = encodeURIComponent(safe(token));
-  // producer shell route: adjust if your app uses a different path
-  return `${APP_BASE_URL}/producer?projectId=${pid}&token=${t}`;
+  const j = await r.json().catch(() => null);
+  if (!r.ok) throw new Error((j && (j.message || j.error)) || `RESEND_HTTP_${r.status}`);
+  return j;
 }
 
 /* -------------------------------------------------------------------------- */
-/*  ROUTES                                                                    */
+/*  ROUTES                                                                     */
 /* -------------------------------------------------------------------------- */
 
 app.get("/", (req, res) => res.send("album-backend OK"));
@@ -201,18 +205,15 @@ app.get(
       ok: true,
       region: AWS_REGION,
       bucketConfigured: !!S3_BUCKET,
-      resendConfigured: !!(RESEND_API_KEY && MAIL_FROM),
+      resendConfigured: !!RESEND_API_KEY,
       appBaseUrl: APP_BASE_URL,
     });
   })
 );
 
 /**
- * ✅ SIGNED PLAYBACK URL
- * webshell222 calls:
- *   GET /api/playback-url?s3Key=...
- * and expects:
- *   { ok:true, url, playbackUrl }
+ * Signed playback URL for audio + cover.
+ * GET /api/playback-url?s3Key=...
  */
 app.get(
   "/api/playback-url",
@@ -221,95 +222,80 @@ app.get(
     if (!s3Key) return res.status(400).json({ ok: false, error: "MISSING_s3Key" });
     if (!S3_BUCKET) return res.status(500).json({ ok: false, error: "MISSING_S3_BUCKET" });
 
-    const expiresIn = 60 * 20; // 20 minutes
-
+    const expiresIn = 60 * 20; // 20 min
     const url = await getSignedUrl(s3, new GetObjectCommand({ Bucket: S3_BUCKET, Key: s3Key }), { expiresIn });
-
-    return res.json({ ok: true, s3Key, url, playbackUrl: url, expiresIn });
+    res.json({ ok: true, s3Key, url, playbackUrl: url, expiresIn });
   })
 );
 
 /**
- * ✅ SEND MAGIC LINK EMAIL (BETA)
+ * Magic link send (beta).
  * POST /api/magic-link/send
- * body: { to, projectId, producerName? }
- *
- * NOTE:
- * - This does NOT create any project data.
- * - It only creates a token + stores a minimal record in S3 so you can validate later.
+ * body: { to, projectId, expiresInMinutes?, dryRun? }
  */
 app.post(
   "/api/magic-link/send",
   wrap(async (req, res) => {
     const to = safe(req.body?.to);
     const projectId = safe(req.body?.projectId);
-    const producerName = safe(req.body?.producerName);
+    const dryRun = req.body?.dryRun === true;
+    const expiresInMinutes = Number(req.body?.expiresInMinutes || 60 * 24 * 7); // default 7 days
 
-    if (!to || !isEmail(to)) return res.status(400).json({ ok: false, error: "INVALID_to" });
+    if (!to) return res.status(400).json({ ok: false, error: "MISSING_to" });
     if (!projectId) return res.status(400).json({ ok: false, error: "MISSING_projectId" });
 
-    if (!resend || !RESEND_API_KEY) return res.status(500).json({ ok: false, error: "MISSING_RESEND_API_KEY" });
-    if (!MAIL_FROM) return res.status(500).json({ ok: false, error: "MISSING_MAIL_FROM" });
-
-    // token + storage (so you can validate later if you want)
-    const token = randHex(32);
+    const token = randHex(48);
     const createdAt = new Date().toISOString();
+    const expiresAt = new Date(Date.now() + Math.max(5, expiresInMinutes) * 60 * 1000).toISOString();
 
-    // Store token record (optional but recommended)
-    // You can later use this to validate producer sessions.
+    const magicLinkUrl = `${APP_BASE_URL.replace(/\/+$/, "")}/minisite?projectId=${encodeURIComponent(
+      projectId
+    )}&token=${encodeURIComponent(token)}`;
+
+    // Record token in S3 so minisite can validate later (even if you don’t use it yet)
+    // You can extend later: status, consumedAt, etc.
     const tokenKey = `storage/projects/${projectId}/magic_links/${token}.json`;
-    await putJson(tokenKey, {
-      projectId,
-      token,
-      to,
-      producerName,
-      createdAt,
-      status: "sent",
-      appBaseUrl: APP_BASE_URL,
-    });
+    await putJson(tokenKey, { projectId, to, token, createdAt, expiresAt, status: "active" });
 
-    const url = buildMagicLinkUrl({ projectId, token });
-
-    const subject = `Your producer link${projectId ? ` (Project ${projectId})` : ""}`;
-    const greeting = producerName ? `Hi ${producerName},` : "Hi,";
-    const text = `${greeting}
-
-Here’s your secure producer link:
-${url}
-
-If you didn’t request this, you can ignore this email.`;
-
+    const subject = `Your Blackout Producer Link (${projectId})`;
     const html = `
       <div style="font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial;">
-        <p>${greeting}</p>
-        <p>Here’s your secure producer link:</p>
-        <p><a href="${url}" style="font-weight:700;">Open Producer Link</a></p>
-        <p style="opacity:.8; font-size:12px; word-break:break-all;">${url}</p>
-        <hr style="border:none; border-top:1px solid #eee; margin:16px 0;" />
-        <p style="opacity:.7; font-size:12px;">If you didn’t request this, you can ignore this email.</p>
+        <h2 style="margin:0 0 12px 0;">Blackout Producer Link</h2>
+        <div style="margin:0 0 10px 0; opacity:0.8;">Project ID: <b>${projectId}</b></div>
+        <div style="margin:0 0 14px 0;">Click to open your link:</div>
+        <div style="margin:0 0 18px 0;">
+          <a href="${magicLinkUrl}" style="display:inline-block;padding:10px 14px;border-radius:12px;background:#111;color:#fff;text-decoration:none;">
+            Open Producer Mini-site
+          </a>
+        </div>
+        <div style="font-size:12px;opacity:0.7;word-break:break-word;">${magicLinkUrl}</div>
+        <div style="margin-top:14px;font-size:12px;opacity:0.7;">Expires: ${expiresAt}</div>
       </div>
     `;
 
-    const out = await resend.emails.send({
-      from: MAIL_FROM,
-      to,
-      subject,
-      text,
-      html,
-    });
+    let resendResult = null;
+    if (!dryRun) {
+      resendResult = await sendResendEmail({ to, subject, html });
+    }
 
-    return res.json({
+    res.json({
       ok: true,
-      projectId,
       to,
-      producerName: producerName || "",
+      projectId,
       token,
-      url,
-      resendId: safe(out?.data?.id || ""),
+      tokenKey,
+      magicLinkUrl,
+      createdAt,
+      expiresAt,
+      dryRun,
+      resendResult,
     });
   })
 );
 
+/**
+ * Publish endpoints (unchanged behavior)
+ */
 app.get(
   "/publish/:shareId.json",
   wrap(async (req, res) => {
@@ -318,7 +304,7 @@ app.get(
 
     const key = `public/publish/${shareId}.json`;
     const json = await readJson(key);
-    return res.json(json);
+    res.json(json);
   })
 );
 
@@ -353,7 +339,7 @@ app.post(
       createdAt: new Date().toISOString(),
     });
 
-    return res.json({
+    res.json({
       ok: true,
       shareId,
       snapshotKey,
@@ -363,53 +349,19 @@ app.post(
 );
 
 // Alias
-app.post(
-  "/api/publish",
-  wrap(async (req, res) => {
-    const projectId = safe(req.body?.projectId);
-    let snapshotKey = safe(req.body?.snapshotKey);
-
-    if (!projectId && !snapshotKey) {
-      return res.status(400).json({ ok: false, error: "MISSING_projectId_AND_snapshotKey" });
-    }
-
-    if (!snapshotKey) {
-      const metaKey = `storage/projects/${projectId}/producer_returns/latest.json`;
-      const meta = await readJson(metaKey);
-      snapshotKey = safe(meta?.latestSnapshotKey);
-      if (!snapshotKey) throw new Error("LATEST_snapshotKey_MISSING");
-    }
-
-    const rawSnapshot = await readJson(snapshotKey);
-    const cleanSnapshot = stripPlaybackUrls(rawSnapshot);
-
-    const shareId = randHex(24);
-    const publicKey = `public/publish/${shareId}.json`;
-
-    await putJson(publicKey, {
-      shareId,
-      projectId: projectId || safe(cleanSnapshot?.projectId) || "",
-      snapshotKey,
-      snapshot: cleanSnapshot,
-      createdAt: new Date().toISOString(),
-    });
-
-    return res.json({
-      ok: true,
-      shareId,
-      snapshotKey,
-      publicUrl: `${req.protocol}://${req.get("host")}/publish/${shareId}.json`,
-    });
-  })
-);
+app.post("/api/publish", (req, res, next) => app._router.handle(req, res, next));
 
 /* -------------------------------------------------------------------------- */
-/*  JSON error handler (ensures no Express HTML 500)                           */
+/*  404 + JSON error handler                                                   */
 /* -------------------------------------------------------------------------- */
+
+app.use((req, res) => {
+  applyCors(req, res);
+  res.status(404).json({ ok: false, error: "NOT_FOUND", path: req.path });
+});
 
 app.use((err, req, res, next) => {
   logErr(req, err);
-
   try {
     applyCors(req, res);
   } catch {}
@@ -417,19 +369,15 @@ app.use((err, req, res, next) => {
   if (res.headersSent) return next(err);
 
   const msg = errString(err);
-
-  if (msg.includes("NoSuchKey") || msg.includes("NotFound") || msg.includes("404") || msg.includes("NOT_FOUND")) {
-    return res.status(404).json({ ok: false, error: "NOT_FOUND" });
-  }
-
-  return res.status(500).json({ ok: false, error: msg });
+  const status = msg.includes("NoSuchKey") || msg.includes("NotFound") ? 404 : 500;
+  res.status(status).json({ ok: false, error: msg });
 });
 
 /* -------------------------------------------------------------------------- */
-/*  START                                                                     */
+/*  START                                                                      */
 /* -------------------------------------------------------------------------- */
 
-const PORT = process.env.PORT || 3001;
+const PORT = Number(process.env.PORT || 3001);
 app.listen(PORT, () => console.log(`album-backend listening on ${PORT}`));
 
 process.on("unhandledRejection", (e) => console.error("unhandledRejection", e));
