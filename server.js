@@ -4,6 +4,7 @@
 import express from "express";
 import { S3Client, GetObjectCommand, PutObjectCommand } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
+console.log("SERVER FILE PATH:", new URL(import.meta.url).pathname);
 
 const app = express();
 console.log("BOOT: album-backend server.js vMAGICLINK-RESEND-S3-SIGN-2026-02-11");
